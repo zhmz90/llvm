@@ -177,6 +177,11 @@ DisableTailCalls("disable-tail-calls",
                  cl::desc("Never emit tail calls"),
                  cl::init(false));
 
+cl::opt<bool>
+StackSymbolOrdering("stack-symbol-ordering",
+                    cl::desc("Order local stack symbols."),
+                    cl::init(true));
+
 cl::opt<unsigned>
 OverrideStackAlignment("stack-alignment",
                        cl::desc("Override default stack alignment"),
@@ -191,11 +196,6 @@ cl::opt<std::string>
 TrapFuncName("trap-func", cl::Hidden,
         cl::desc("Emit a call to trap function rather than a trap instruction"),
         cl::init(""));
-
-cl::opt<bool>
-EnablePIE("enable-pie",
-          cl::desc("Assume the creation of a position independent executable."),
-          cl::init(false));
 
 cl::opt<bool>
 UseCtors("use-ctors",
@@ -284,7 +284,7 @@ static inline TargetOptions InitTargetOptionsFromCodeGenFlags() {
   Options.NoZerosInBSS = DontPlaceZerosInBSS;
   Options.GuaranteedTailCallOpt = EnableGuaranteedTailCallOpt;
   Options.StackAlignmentOverride = OverrideStackAlignment;
-  Options.PositionIndependentExecutable = EnablePIE;
+  Options.StackSymbolOrdering = StackSymbolOrdering;
   Options.UseInitArray = !UseCtors;
   Options.DataSections = DataSections;
   Options.FunctionSections = FunctionSections;

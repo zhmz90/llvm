@@ -85,7 +85,7 @@ computeTargetABI(const Triple &TT, StringRef CPU,
         (TT.getOS() == llvm::Triple::UnknownOS && TT.isOSBinFormatMachO()) ||
         CPU.startswith("cortex-m")) {
       TargetABI = ARMBaseTargetMachine::ARM_ABI_AAPCS;
-    } else if (TT.isWatchOS()) {
+    } else if (TT.isWatchABI()) {
       TargetABI = ARMBaseTargetMachine::ARM_ABI_AAPCS16;
     } else {
       TargetABI = ARMBaseTargetMachine::ARM_ABI_APCS;
@@ -219,7 +219,6 @@ ARMBaseTargetMachine::getSubtargetImpl(const Function &F) const {
   // it as a key for the subtarget since that can be the only difference
   // between two functions.
   bool SoftFloat =
-      F.hasFnAttribute("use-soft-float") &&
       F.getFnAttribute("use-soft-float").getValueAsString() == "true";
   // If the soft float attribute is set on the function turn on the soft float
   // subtarget feature.

@@ -45,7 +45,6 @@ class TargetIntrinsicInfo;
 class TargetLowering;
 class TargetPassConfig;
 class TargetRegisterInfo;
-class TargetSelectionDAGInfo;
 class TargetSubtargetInfo;
 class TargetTransformInfo;
 class formatted_raw_ostream;
@@ -103,11 +102,6 @@ protected: // Can only create subclasses.
 
   unsigned RequireStructuredCFG : 1;
   unsigned O0WantsFastISel : 1;
-
-  /// This API is here to support the C API, deprecated in 3.7 release.
-  /// This should never be used outside of legacy existing client.
-  const DataLayout &getDataLayout() const { return DL; }
-  friend struct C_API_PRIVATE_ACCESS;
 
 public:
   mutable TargetOptions Options;
@@ -222,6 +216,11 @@ public:
   /// set up appropriately for this target machine. Even the old pass manager
   /// uses this to answer queries about the IR.
   virtual TargetIRAnalysis getTargetIRAnalysis();
+
+  /// Add target-specific function passes that should be run as early as
+  /// possible in the optimization pipeline.  Most TargetMachines have no such
+  /// passes.
+  virtual void addEarlyAsPossiblePasses(PassManagerBase &) {}
 
   /// These enums are meant to be passed into addPassesToEmitFile to indicate
   /// what type of file to emit, and returned by it to indicate what type of

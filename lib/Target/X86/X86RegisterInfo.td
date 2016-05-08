@@ -415,6 +415,18 @@ def GR32_NOREX_NOSP : RegisterClass<"X86", [i32], 32,
 def GR64_NOREX_NOSP : RegisterClass<"X86", [i64], 64,
                                     (and GR64_NOREX, GR64_NOSP)>;
 
+// Register classes used for ABIs that use 32-bit address accesses,
+// while using the whole x84_64 ISA.
+
+// In such cases, it is fine to use RIP as we are sure the 32 high
+// bits are not set. We do not need variants for NOSP as RIP is not
+// allowed there.
+// Alignment is 64 because we have RIP.
+// FIXME: We could allow all 64bit registers, but we would need
+// something to check that the 32 high bits are not set,
+// which we do not have right now.
+def LOW32_ADDR_ACCESS : RegisterClass<"X86", [i32], 64, (add GR32, RIP)>;
+
 // A class to support the 'A' assembler constraint: EAX then EDX.
 def GR32_AD : RegisterClass<"X86", [i32], 32, (add EAX, EDX)>;
 
@@ -477,18 +489,18 @@ def VR256X : RegisterClass<"X86", [v8f32, v4f64, v32i8, v16i16, v8i32, v4i64],
                            256, (sequence "YMM%u", 0, 31)>;
 
 // Mask registers
-def VK1     : RegisterClass<"X86", [i1],    8,  (sequence "K%u", 0, 7)> {let Size = 8;}
-def VK2     : RegisterClass<"X86", [v2i1],  8,  (add VK1)> {let Size = 8;}
-def VK4     : RegisterClass<"X86", [v4i1],  8,  (add VK2)> {let Size = 8;}
-def VK8     : RegisterClass<"X86", [v8i1],  8,  (add VK4)> {let Size = 8;}
+def VK1     : RegisterClass<"X86", [i1],    16,  (sequence "K%u", 0, 7)> {let Size = 16;}
+def VK2     : RegisterClass<"X86", [v2i1],  16,  (add VK1)> {let Size = 16;}
+def VK4     : RegisterClass<"X86", [v4i1],  16,  (add VK2)> {let Size = 16;}
+def VK8     : RegisterClass<"X86", [v8i1],  16,  (add VK4)> {let Size = 16;}
 def VK16    : RegisterClass<"X86", [v16i1], 16, (add VK8)> {let Size = 16;}
 def VK32    : RegisterClass<"X86", [v32i1], 32, (add VK16)> {let Size = 32;}
 def VK64    : RegisterClass<"X86", [v64i1], 64, (add VK32)> {let Size = 64;}
 
-def VK1WM   : RegisterClass<"X86", [i1],    8,  (sub VK1, K0)> {let Size = 8;}
-def VK2WM   : RegisterClass<"X86", [v2i1],  8,  (sub VK2, K0)> {let Size = 8;}
-def VK4WM   : RegisterClass<"X86", [v4i1],  8,  (sub VK4, K0)> {let Size = 8;}
-def VK8WM   : RegisterClass<"X86", [v8i1],  8,  (sub VK8, K0)> {let Size = 8;}
+def VK1WM   : RegisterClass<"X86", [i1],    16,  (sub VK1, K0)> {let Size = 16;}
+def VK2WM   : RegisterClass<"X86", [v2i1],  16,  (sub VK2, K0)> {let Size = 16;}
+def VK4WM   : RegisterClass<"X86", [v4i1],  16,  (sub VK4, K0)> {let Size = 16;}
+def VK8WM   : RegisterClass<"X86", [v8i1],  16,  (sub VK8, K0)> {let Size = 16;}
 def VK16WM  : RegisterClass<"X86", [v16i1], 16, (add VK8WM)>   {let Size = 16;}
 def VK32WM  : RegisterClass<"X86", [v32i1], 32, (add VK16WM)> {let Size = 32;}
 def VK64WM  : RegisterClass<"X86", [v64i1], 64, (add VK32WM)> {let Size = 64;}

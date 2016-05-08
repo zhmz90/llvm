@@ -12,11 +12,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/AsmPrinter.h"
+#include "CodeViewDebug.h"
 #include "DwarfDebug.h"
 #include "DwarfException.h"
 #include "WinException.h"
-#include "WinCodeViewLineTables.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/CodeGen/Analysis.h"
@@ -192,22 +191,26 @@ bool AsmPrinter::doInitialization(Module &M) {
   // use the directive, where it would need the same conditionalization
   // anyway.
   Triple TT(getTargetTriple());
-  if (TT.isOSDarwin()) {
+  // If there is a version specified, Major will be non-zero.
+  if (TT.isOSDarwin() && TT.getOSMajorVersion() != 0) {
     unsigned Major, Minor, Update;
-    TT.getOSVersion(Major, Minor, Update);
-    // If there is a version specified, Major will be non-zero.
-    if (Major) {
-      MCVersionMinType VersionType;
-      if (TT.isWatchOS())
-        VersionType = MCVM_WatchOSVersionMin;
-      else if (TT.isTvOS())
-        VersionType = MCVM_TvOSVersionMin;
-      else if (TT.isMacOSX())
-        VersionType = MCVM_OSXVersionMin;
-      else
-        VersionType = MCVM_IOSVersionMin;
-      OutStreamer->EmitVersionMin(VersionType, Major, Minor, Update);
+    MCVersionMinType VersionType;
+    if (TT.isWatchOS()) {
+      VersionType = MCVM_WatchOSVersionMin;
+      TT.getWatchOSVersion(Major, Minor, Update);
+    } else if (TT.isTvOS()) {
+      VersionType = MCVM_TvOSVersionMin;
+      TT.getiOSVersion(Major, Minor, Update);
+    } else if (TT.isMacOSX()) {
+      VersionType = MCVM_OSXVersionMin;
+      if (!TT.getMacOSXVersion(Major, Minor, Update))
+        Major = 0;
+    } else {
+      VersionType = MCVM_IOSVersionMin;
+      TT.getiOSVersion(Major, Minor, Update);
     }
+    if (Major != 0)
+      OutStreamer->EmitVersionMin(VersionType, Major, Minor, Update);
   }
 
   // Allow the target to emit any magic that it wants at the start of the file.
@@ -244,7 +247,7 @@ bool AsmPrinter::doInitialization(Module &M) {
   if (MAI->doesSupportDebugInformation()) {
     bool EmitCodeView = MMI->getModule()->getCodeViewFlag();
     if (EmitCodeView && TM.getTargetTriple().isKnownWindowsMSVCEnvironment()) {
-      Handlers.push_back(HandlerInfo(new WinCodeViewLineTables(this),
+      Handlers.push_back(HandlerInfo(new CodeViewDebug(this),
                                      DbgTimerName,
                                      CodeViewLineTablesGroupName));
     }
@@ -343,50 +346,16 @@ MCSymbol *AsmPrinter::getSymbol(const GlobalValue *GV) const {
   return TM.getSymbol(GV, *Mang);
 }
 
-static MCSymbol *getOrCreateEmuTLSControlSym(MCSymbol *GVSym, MCContext &C) {
-  return C.getOrCreateSymbol(Twine("__emutls_v.") + GVSym->getName());
-}
-
-static MCSymbol *getOrCreateEmuTLSInitSym(MCSymbol *GVSym, MCContext &C) {
-  return C.getOrCreateSymbol(Twine("__emutls_t.") + GVSym->getName());
-}
-
-/// EmitEmulatedTLSControlVariable - Emit the control variable for an emulated TLS variable.
-void AsmPrinter::EmitEmulatedTLSControlVariable(const GlobalVariable *GV,
-                                                MCSymbol *EmittedSym,
-                                                bool AllZeroInitValue) {
-  MCSection *TLSVarSection = getObjFileLowering().getDataSection();
-  OutStreamer->SwitchSection(TLSVarSection);
-  MCSymbol *GVSym = getSymbol(GV);
-  EmitLinkage(GV, EmittedSym);  // same linkage as GV
-  const DataLayout &DL = GV->getParent()->getDataLayout();
-  uint64_t Size = DL.getTypeAllocSize(GV->getType()->getElementType());
-  unsigned AlignLog = getGVAlignmentLog2(GV, DL);
-  unsigned WordSize = DL.getPointerSize();
-  unsigned Alignment = DL.getPointerABIAlignment();
-  EmitAlignment(Log2_32(Alignment));
-  OutStreamer->EmitLabel(EmittedSym);
-  OutStreamer->EmitIntValue(Size, WordSize);
-  OutStreamer->EmitIntValue((1 << AlignLog), WordSize);
-  OutStreamer->EmitIntValue(0, WordSize);
-  if (GV->hasInitializer() && !AllZeroInitValue) {
-    OutStreamer->EmitSymbolValue(
-        getOrCreateEmuTLSInitSym(GVSym, OutContext), WordSize);
-  } else
-    OutStreamer->EmitIntValue(0, WordSize);
-  if (MAI->hasDotTypeDotSizeDirective())
-    OutStreamer->emitELFSize(cast<MCSymbolELF>(EmittedSym),
-                             MCConstantExpr::create(4 * WordSize, OutContext));
-  OutStreamer->AddBlankLine();  // End of the __emutls_v.* variable.
-}
-
 /// EmitGlobalVariable - Emit the specified global variable to the .s file.
 void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
-  bool IsEmuTLSVar =
-      GV->getThreadLocalMode() != llvm::GlobalVariable::NotThreadLocal &&
-      TM.Options.EmulatedTLS;
+  bool IsEmuTLSVar = TM.Options.EmulatedTLS && GV->isThreadLocal();
   assert(!(IsEmuTLSVar && GV->hasCommonLinkage()) &&
          "No emulated TLS variables in the common section");
+
+  // Never emit TLS variable xyz in emulated TLS model.
+  // The initialization value is in __emutls_t.xyz instead of xyz.
+  if (IsEmuTLSVar)
+    return;
 
   if (GV->hasInitializer()) {
     // Check to see if this is a special global used by LLVM, if so, emit it.
@@ -398,7 +367,7 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
     if (GlobalGOTEquivs.count(getSymbol(GV)))
       return;
 
-    if (isVerbose() && !IsEmuTLSVar) {
+    if (isVerbose()) {
       // When printing the control variable __emutls_v.*,
       // we don't need to print the original TLS variable name.
       GV->printAsOperand(OutStreamer->GetCommentOS(),
@@ -408,8 +377,7 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
   }
 
   MCSymbol *GVSym = getSymbol(GV);
-  MCSymbol *EmittedSym = IsEmuTLSVar ?
-      getOrCreateEmuTLSControlSym(GVSym, OutContext) : GVSym;
+  MCSymbol *EmittedSym = GVSym;
   // getOrCreateEmuTLSControlSym only creates the symbol with name and default attributes.
   // GV's or GVSym's attributes will be used for the EmittedSym.
 
@@ -436,18 +404,6 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
   // sections and expected to be contiguous (e.g. ObjC metadata).
   unsigned AlignLog = getGVAlignmentLog2(GV, DL);
 
-  bool AllZeroInitValue = false;
-  const Constant *InitValue = GV->getInitializer();
-  if (isa<ConstantAggregateZero>(InitValue))
-    AllZeroInitValue = true;
-  else {
-    const ConstantInt *InitIntValue = dyn_cast<ConstantInt>(InitValue);
-    if (InitIntValue && InitIntValue->isZero())
-      AllZeroInitValue = true;
-  }
-  if (IsEmuTLSVar)
-    EmitEmulatedTLSControlVariable(GV, EmittedSym, AllZeroInitValue);
-
   for (const HandlerInfo &HI : Handlers) {
     NamedRegionTimer T(HI.TimerName, HI.TimerGroupName, TimePassesIsEnabled);
     HI.Handler->setSymbolSize(GVSym, Size);
@@ -455,8 +411,6 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
 
   // Handle common and BSS local symbols (.lcomm).
   if (GVKind.isCommon() || GVKind.isBSSLocal()) {
-    assert(!(IsEmuTLSVar && GVKind.isCommon()) &&
-           "No emulated TLS variables in the common section");
     if (Size == 0) Size = 1;   // .comm Foo, 0 is undefined, avoid it.
     unsigned Align = 1 << AlignLog;
 
@@ -501,21 +455,14 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
     return;
   }
 
-  if (IsEmuTLSVar && AllZeroInitValue)
-    return;  // No need of initialization values.
+  MCSymbol *EmittedInitSym = GVSym;
 
-  MCSymbol *EmittedInitSym = IsEmuTLSVar ?
-      getOrCreateEmuTLSInitSym(GVSym, OutContext) : GVSym;
-  // getOrCreateEmuTLSInitSym only creates the symbol with name and default attributes.
-  // GV's or GVSym's attributes will be used for the EmittedInitSym.
-
-  MCSection *TheSection = IsEmuTLSVar ?
-      getObjFileLowering().getReadOnlySection() :
+  MCSection *TheSection =
       getObjFileLowering().SectionForGlobal(GV, GVKind, *Mang, TM);
 
   // Handle the zerofill directive on darwin, which is a special form of BSS
   // emission.
-  if (GVKind.isBSSExtern() && MAI->hasMachoZeroFillDirective() && !IsEmuTLSVar) {
+  if (GVKind.isBSSExtern() && MAI->hasMachoZeroFillDirective()) {
     if (Size == 0) Size = 1;  // zerofill of 0 bytes is undefined.
 
     // .globl _foo
@@ -535,7 +482,7 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
   // TLOF class.  This will also make it more obvious that stuff like
   // MCStreamer::EmitTBSSSymbol is macho specific and only called from macho
   // specific code.
-  if (GVKind.isThreadLocal() && MAI->hasMachoTBSSDirective() && !IsEmuTLSVar) {
+  if (GVKind.isThreadLocal() && MAI->hasMachoTBSSDirective()) {
     // Emit the .tbss symbol
     MCSymbol *MangSym =
       OutContext.getOrCreateSymbol(GVSym->getName() + Twine("$tlv$init"));
@@ -579,9 +526,7 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
 
   OutStreamer->SwitchSection(TheSection);
 
-  // emutls_t.* symbols are only used in the current compilation unit.
-  if (!IsEmuTLSVar)
-    EmitLinkage(GV, EmittedInitSym);
+  EmitLinkage(GV, EmittedInitSym);
   EmitAlignment(AlignLog, GV);
 
   OutStreamer->EmitLabel(EmittedInitSym);
@@ -1114,6 +1059,52 @@ void AsmPrinter::emitGlobalGOTEquivs() {
     EmitGlobalVariable(GV);
 }
 
+void AsmPrinter::emitGlobalIndirectSymbol(Module &M,
+                                          const GlobalIndirectSymbol& GIS) {
+  MCSymbol *Name = getSymbol(&GIS);
+
+  if (GIS.hasExternalLinkage() || !MAI->getWeakRefDirective())
+    OutStreamer->EmitSymbolAttribute(Name, MCSA_Global);
+  else if (GIS.hasWeakLinkage() || GIS.hasLinkOnceLinkage())
+    OutStreamer->EmitSymbolAttribute(Name, MCSA_WeakReference);
+  else
+    assert(GIS.hasLocalLinkage() && "Invalid alias or ifunc linkage");
+
+  // Set the symbol type to function if the alias has a function type.
+  // This affects codegen when the aliasee is not a function.
+  if (GIS.getType()->getPointerElementType()->isFunctionTy()) {
+    OutStreamer->EmitSymbolAttribute(Name, MCSA_ELF_TypeFunction);
+    if (isa<GlobalIFunc>(GIS))
+      OutStreamer->EmitSymbolAttribute(Name, MCSA_ELF_TypeIndFunction);
+  }
+
+  EmitVisibility(Name, GIS.getVisibility());
+
+  const MCExpr *Expr = lowerConstant(GIS.getIndirectSymbol());
+
+  if (isa<GlobalAlias>(&GIS) && MAI->hasAltEntry() && isa<MCBinaryExpr>(Expr))
+    OutStreamer->EmitSymbolAttribute(Name, MCSA_AltEntry);
+
+  // Emit the directives as assignments aka .set:
+  OutStreamer->EmitAssignment(Name, Expr);
+
+  if (auto *GA = dyn_cast<GlobalAlias>(&GIS)) {
+    // If the aliasee does not correspond to a symbol in the output, i.e. the
+    // alias is not of an object or the aliased object is private, then set the
+    // size of the alias symbol from the type of the alias. We don't do this in
+    // other situations as the alias and aliasee having differing types but same
+    // size may be intentional.
+    const GlobalObject *BaseObject = GA->getBaseObject();
+    if (MAI->hasDotTypeDotSizeDirective() && GA->getValueType()->isSized() &&
+        (!BaseObject || BaseObject->hasPrivateLinkage())) {
+      const DataLayout &DL = M.getDataLayout();
+      uint64_t Size = DL.getTypeAllocSize(GA->getValueType());
+      OutStreamer->emitELFSize(cast<MCSymbolELF>(Name),
+                               MCConstantExpr::create(Size, OutContext));
+    }
+  }
+}
+
 bool AsmPrinter::doFinalization(Module &M) {
   // Set the MachineFunction to nullptr so that we can catch attempted
   // accesses to MF specific features at the module level and so that
@@ -1202,40 +1193,26 @@ bool AsmPrinter::doFinalization(Module &M) {
   }
 
   OutStreamer->AddBlankLine();
+
+  // Print aliases in topological order, that is, for each alias a = b,
+  // b must be printed before a.
+  // This is because on some targets (e.g. PowerPC) linker expects aliases in
+  // such an order to generate correct TOC information.
+  SmallVector<const GlobalAlias *, 16> AliasStack;
+  SmallPtrSet<const GlobalAlias *, 16> AliasVisited;
   for (const auto &Alias : M.aliases()) {
-    MCSymbol *Name = getSymbol(&Alias);
-
-    if (Alias.hasExternalLinkage() || !MAI->getWeakRefDirective())
-      OutStreamer->EmitSymbolAttribute(Name, MCSA_Global);
-    else if (Alias.hasWeakLinkage() || Alias.hasLinkOnceLinkage())
-      OutStreamer->EmitSymbolAttribute(Name, MCSA_WeakReference);
-    else
-      assert(Alias.hasLocalLinkage() && "Invalid alias linkage");
-
-    // Set the symbol type to function if the alias has a function type.
-    // This affects codegen when the aliasee is not a function.
-    if (Alias.getType()->getPointerElementType()->isFunctionTy())
-      OutStreamer->EmitSymbolAttribute(Name, MCSA_ELF_TypeFunction);
-
-    EmitVisibility(Name, Alias.getVisibility());
-
-    // Emit the directives as assignments aka .set:
-    OutStreamer->EmitAssignment(Name, lowerConstant(Alias.getAliasee()));
-
-    // If the aliasee does not correspond to a symbol in the output, i.e. the
-    // alias is not of an object or the aliased object is private, then set the
-    // size of the alias symbol from the type of the alias. We don't do this in
-    // other situations as the alias and aliasee having differing types but same
-    // size may be intentional.
-    const GlobalObject *BaseObject = Alias.getBaseObject();
-    if (MAI->hasDotTypeDotSizeDirective() && Alias.getValueType()->isSized() &&
-        (!BaseObject || BaseObject->hasPrivateLinkage())) {
-      const DataLayout &DL = M.getDataLayout();
-      uint64_t Size = DL.getTypeAllocSize(Alias.getValueType());
-      OutStreamer->emitELFSize(cast<MCSymbolELF>(Name),
-                               MCConstantExpr::create(Size, OutContext));
+    for (const GlobalAlias *Cur = &Alias; Cur;
+         Cur = dyn_cast<GlobalAlias>(Cur->getAliasee())) {
+      if (!AliasVisited.insert(Cur).second)
+        break;
+      AliasStack.push_back(Cur);
     }
+    for (const GlobalAlias *AncestorAlias : reverse(AliasStack))
+      emitGlobalIndirectSymbol(M, *AncestorAlias);
+    AliasStack.clear();
   }
+  for (const auto &IFunc : M.ifuncs())
+    emitGlobalIndirectSymbol(M, IFunc);
 
   GCModuleInfo *MI = getAnalysisIfAvailable<GCModuleInfo>();
   assert(MI && "AsmPrinter didn't require GCModuleInfo?");
@@ -1248,9 +1225,10 @@ bool AsmPrinter::doFinalization(Module &M) {
 
   // Emit __morestack address if needed for indirect calls.
   if (MMI->usesMorestackAddr()) {
+    unsigned Align = 1;
     MCSection *ReadOnlySection = getObjFileLowering().getSectionForConstant(
         getDataLayout(), SectionKind::getReadOnly(),
-        /*C=*/nullptr);
+        /*C=*/nullptr, Align);
     OutStreamer->SwitchSection(ReadOnlySection);
 
     MCSymbol *AddrSymbol =
@@ -1340,8 +1318,8 @@ void AsmPrinter::EmitConstantPool() {
     if (!CPE.isMachineConstantPoolEntry())
       C = CPE.Val.ConstVal;
 
-    MCSection *S =
-        getObjFileLowering().getSectionForConstant(getDataLayout(), Kind, C);
+    MCSection *S = getObjFileLowering().getSectionForConstant(getDataLayout(),
+                                                              Kind, C, Align);
 
     // The number of sections are small, just do a linear search from the
     // last section to the first.
@@ -1785,10 +1763,6 @@ const MCExpr *AsmPrinter::lowerConstant(const Constant *CV) {
     llvm_unreachable("Unknown constant value to lower!");
   }
 
-  if (const MCExpr *RelocExpr
-      = getObjFileLowering().getExecutableRelativeSymbol(CE, *Mang, TM))
-    return RelocExpr;
-
   switch (CE->getOpcode()) {
   default:
     // If the code isn't optimized, there may be outstanding folding
@@ -1864,10 +1838,34 @@ const MCExpr *AsmPrinter::lowerConstant(const Constant *CV) {
     return MCBinaryExpr::createAnd(OpExpr, MaskExpr, Ctx);
   }
 
+  case Instruction::Sub: {
+    GlobalValue *LHSGV;
+    APInt LHSOffset;
+    if (IsConstantOffsetFromGlobal(CE->getOperand(0), LHSGV, LHSOffset,
+                                   getDataLayout())) {
+      GlobalValue *RHSGV;
+      APInt RHSOffset;
+      if (IsConstantOffsetFromGlobal(CE->getOperand(1), RHSGV, RHSOffset,
+                                     getDataLayout())) {
+        const MCExpr *RelocExpr = getObjFileLowering().lowerRelativeReference(
+            LHSGV, RHSGV, *Mang, TM);
+        if (!RelocExpr)
+          RelocExpr = MCBinaryExpr::createSub(
+              MCSymbolRefExpr::create(getSymbol(LHSGV), Ctx),
+              MCSymbolRefExpr::create(getSymbol(RHSGV), Ctx), Ctx);
+        int64_t Addend = (LHSOffset - RHSOffset).getSExtValue();
+        if (Addend != 0)
+          RelocExpr = MCBinaryExpr::createAdd(
+              RelocExpr, MCConstantExpr::create(Addend, Ctx), Ctx);
+        return RelocExpr;
+      }
+    }
+  }
+  // else fallthrough
+
   // The MC library also has a right-shift operator, but it isn't consistently
   // signed or unsigned between different targets.
   case Instruction::Add:
-  case Instruction::Sub:
   case Instruction::Mul:
   case Instruction::SDiv:
   case Instruction::SRem:
@@ -2578,7 +2576,7 @@ isBlockOnlyReachableByFallthrough(const MachineBasicBlock *MBB) const {
     // If we are the operands of one of the branches, this is not a fall
     // through. Note that targets with delay slots will usually bundle
     // terminators with the delay slot instruction.
-    for (ConstMIBundleOperands OP(&MI); OP.isValid(); ++OP) {
+    for (ConstMIBundleOperands OP(MI); OP.isValid(); ++OP) {
       if (OP->isJTI())
         return false;
       if (OP->isMBB() && OP->getMBB() == MBB)

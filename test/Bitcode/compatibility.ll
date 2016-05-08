@@ -47,10 +47,36 @@ $comdat.samesize = comdat samesize
 ; CHECK: @const.struct = constant %const.struct.type { i32 -1, i8 undef }
 @const.struct.packed = constant %const.struct.type.packed <{ i32 -1, i8 1 }>
 ; CHECK: @const.struct.packed = constant %const.struct.type.packed <{ i32 -1, i8 1 }>
-@const.array = constant [2 x i32] [i32 -3, i32 -4]
-; CHECK: @const.array = constant [2 x i32] [i32 -3, i32 -4]
-@const.vector = constant <2 x i32> <i32 -5, i32 -6>
-; CHECK: @const.vector = constant <2 x i32> <i32 -5, i32 -6>
+
+; CHECK: @constant.array.i8  = constant [3 x i8] c"\00\01\00"
+@constant.array.i8  = constant [3 x i8] [i8 -0, i8 1, i8 0]
+; CHECK: @constant.array.i16 = constant [3 x i16] [i16 0, i16 1, i16 0]
+@constant.array.i16 = constant [3 x i16] [i16 -0, i16 1, i16 0]
+; CHECK: @constant.array.i32 = constant [3 x i32] [i32 0, i32 1, i32 0]
+@constant.array.i32 = constant [3 x i32] [i32 -0, i32 1, i32 0]
+; CHECK: @constant.array.i64 = constant [3 x i64] [i64 0, i64 1, i64 0]
+@constant.array.i64 = constant [3 x i64] [i64 -0, i64 1, i64 0]
+; CHECK: @constant.array.f16 = constant [3 x half] [half 0xH8000, half 0xH3C00, half 0xH0000]
+@constant.array.f16 = constant [3 x half] [half -0.0, half 1.0, half 0.0]
+; CHECK: @constant.array.f32 = constant [3 x float] [float -0.000000e+00, float 1.000000e+00, float 0.000000e+00]
+@constant.array.f32 = constant [3 x float] [float -0.0, float 1.0, float 0.0]
+; CHECK: @constant.array.f64 = constant [3 x double] [double -0.000000e+00, double 1.000000e+00, double 0.000000e+00]
+@constant.array.f64 = constant [3 x double] [double -0.0, double 1.0, double 0.0]
+
+; CHECK: @constant.vector.i8  = constant <3 x i8>  <i8 0, i8 1, i8 0>
+@constant.vector.i8  = constant <3 x i8>  <i8 -0, i8 1, i8 0>
+; CHECK: @constant.vector.i16 = constant <3 x i16> <i16 0, i16 1, i16 0>
+@constant.vector.i16 = constant <3 x i16> <i16 -0, i16 1, i16 0>
+; CHECK: @constant.vector.i32 = constant <3 x i32> <i32 0, i32 1, i32 0>
+@constant.vector.i32 = constant <3 x i32> <i32 -0, i32 1, i32 0>
+; CHECK: @constant.vector.i64 = constant <3 x i64> <i64 0, i64 1, i64 0>
+@constant.vector.i64 = constant <3 x i64> <i64 -0, i64 1, i64 0>
+; CHECK: @constant.vector.f16 = constant <3 x half> <half 0xH8000, half 0xH3C00, half 0xH0000>
+@constant.vector.f16 = constant <3 x half> <half -0.0, half 1.0, half 0.0>
+; CHECK: @constant.vector.f32 = constant <3 x float> <float -0.000000e+00, float 1.000000e+00, float 0.000000e+00>
+@constant.vector.f32 = constant <3 x float> <float -0.0, float 1.0, float 0.0>
+; CHECK: @constant.vector.f64 = constant <3 x double> <double -0.000000e+00, double 1.000000e+00, double 0.000000e+00>
+@constant.vector.f64 = constant <3 x double> <double -0.0, double 1.0, double 0.0>
 
 ;; Global Variables
 ; Format: [@<GlobalVarName> =] [Linkage] [Visibility] [DLLStorageClass]
@@ -223,6 +249,31 @@ declare void @g.f1()
 @a.unnamed_addr = unnamed_addr alias i32, i32* @g.unnamed_addr
 ; CHECK: @a.unnamed_addr = unnamed_addr alias i32, i32* @g.unnamed_addr
 
+;; IFunc
+; Format @<Name> = [Linkage] [Visibility] ifunc <IFuncTy>,
+;                  <ResolverTy>* @<Resolver>
+
+; IFunc -- Linkage
+@ifunc.external = external ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.external = ifunc void (), i8* ()* @ifunc_resolver
+@ifunc.private = private ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.private = private ifunc void (), i8* ()* @ifunc_resolver
+@ifunc.internal = internal ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.internal = internal ifunc void (), i8* ()* @ifunc_resolver
+
+; IFunc -- Visibility
+@ifunc.default = default ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.default = ifunc void (), i8* ()* @ifunc_resolver
+@ifunc.hidden = hidden ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.hidden = hidden ifunc void (), i8* ()* @ifunc_resolver
+@ifunc.protected = protected ifunc void (), i8* ()* @ifunc_resolver
+; CHECK: @ifunc.protected = protected ifunc void (), i8* ()* @ifunc_resolver
+
+define i8* @ifunc_resolver() {
+entry:
+  ret i8* null
+}
+
 ;; Functions
 ; Format: define [linkage] [visibility] [DLLStorageClass]
 ;         [cconv] [ret attrs]
@@ -377,6 +428,46 @@ declare cc80 void @f.cc80()
 ; CHECK: declare x86_vectorcallcc void @f.cc80()
 declare x86_vectorcallcc void @f.x86_vectorcallcc()
 ; CHECK: declare x86_vectorcallcc void @f.x86_vectorcallcc()
+declare cc81 void @f.cc81()
+; CHECK: declare hhvmcc void @f.cc81()
+declare hhvmcc void @f.hhvmcc()
+; CHECK: declare hhvmcc void @f.hhvmcc()
+declare cc82 void @f.cc82()
+; CHECK: declare hhvm_ccc void @f.cc82()
+declare hhvm_ccc void @f.hhvm_ccc()
+; CHECK: declare hhvm_ccc void @f.hhvm_ccc()
+declare cc83 void @f.cc83()
+; CHECK: declare x86_intrcc void @f.cc83()
+declare x86_intrcc void @f.x86_intrcc()
+; CHECK: declare x86_intrcc void @f.x86_intrcc()
+declare cc84 void @f.cc84()
+; CHECK: declare avr_intrcc void @f.cc84()
+declare avr_intrcc void @f.avr_intrcc()
+; CHECK: declare avr_intrcc void @f.avr_intrcc()
+declare cc85 void @f.cc85()
+; CHECK: declare avr_signalcc void @f.cc85()
+declare avr_signalcc void @f.avr_signalcc()
+; CHECK: declare avr_signalcc void @f.avr_signalcc()
+declare cc87 void @f.cc87()
+; CHECK: declare amdgpu_vs void @f.cc87()
+declare amdgpu_vs void @f.amdgpu_vs()
+; CHECK: declare amdgpu_vs void @f.amdgpu_vs()
+declare cc88 void @f.cc88()
+; CHECK: declare amdgpu_gs void @f.cc88()
+declare amdgpu_gs void @f.amdgpu_gs()
+; CHECK: declare amdgpu_gs void @f.amdgpu_gs()
+declare cc89 void @f.cc89()
+; CHECK: declare amdgpu_ps void @f.cc89()
+declare amdgpu_ps void @f.amdgpu_ps()
+; CHECK: declare amdgpu_ps void @f.amdgpu_ps()
+declare cc90 void @f.cc90()
+; CHECK: declare amdgpu_cs void @f.cc90()
+declare amdgpu_cs void @f.amdgpu_cs()
+; CHECK: declare amdgpu_cs void @f.amdgpu_cs()
+declare cc91 void @f.cc91()
+; CHECK: declare amdgpu_kernel void @f.cc91()
+declare amdgpu_kernel void @f.amdgpu_kernel()
+; CHECK: declare amdgpu_kernel void @f.amdgpu_kernel()
 declare cc1023 void @f.cc1023()
 ; CHECK: declare cc1023 void @f.cc1023()
 
@@ -859,17 +950,24 @@ catchpad:
   ; CHECK-NEXT: br label %body
 
 body:
-  invoke void @f.ccc() to label %continue unwind label %terminate
+  invoke void @f.ccc() [ "funclet"(token %catch) ]
+    to label %continue unwind label %terminate.inner
   catchret from %catch to label %return
   ; CHECK: catchret from %catch to label %return
 
 return:
   ret i32 0
 
-terminate:
-  cleanuppad within %cs []
+terminate.inner:
+  cleanuppad within %catch []
   unreachable
-  ; CHECK: cleanuppad within %cs []
+  ; CHECK: cleanuppad within %catch []
+  ; CHECK-NEXT: unreachable
+
+terminate:
+  cleanuppad within none []
+  unreachable
+  ; CHECK: cleanuppad within none []
   ; CHECK-NEXT: unreachable
 
 continue:

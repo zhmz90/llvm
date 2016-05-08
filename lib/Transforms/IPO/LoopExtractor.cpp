@@ -38,7 +38,7 @@ namespace {
     static char ID; // Pass identification, replacement for typeid
     unsigned NumLoops;
 
-    explicit LoopExtractor(unsigned numLoops = ~0) 
+    explicit LoopExtractor(unsigned numLoops = ~0)
       : LoopPass(ID), NumLoops(numLoops) {
         initializeLoopExtractorPass(*PassRegistry::getPassRegistry());
       }
@@ -81,7 +81,7 @@ INITIALIZE_PASS(SingleLoopExtractor, "loop-extract-single",
 Pass *llvm::createLoopExtractorPass() { return new LoopExtractor(); }
 
 bool LoopExtractor::runOnLoop(Loop *L, LPPassManager &) {
-  if (skipOptnoneFunction(L))
+  if (skipLoop(L))
     return false;
 
   // Only visit top-level loops.
@@ -143,7 +143,7 @@ bool LoopExtractor::runOnLoop(Loop *L, LPPassManager &) {
       Changed = true;
       // After extraction, the loop is replaced by a function call, so
       // we shouldn't try to run any more loop passes on it.
-      LI.updateUnloop(L);
+      LI.markAsRemoved(L);
     }
     ++NumExtracted;
   }
@@ -249,6 +249,9 @@ void BlockExtractorPass::SplitLandingPadPreds(Function *F) {
 }
 
 bool BlockExtractorPass::runOnModule(Module &M) {
+  if (skipModule(M))
+    return false;
+
   std::set<BasicBlock*> TranslatedBlocksToNotExtract;
   for (unsigned i = 0, e = BlocksToNotExtract.size(); i != e; ++i) {
     BasicBlock *BB = BlocksToNotExtract[i];

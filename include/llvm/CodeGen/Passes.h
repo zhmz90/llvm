@@ -216,6 +216,19 @@ public:
     return true;
   }
 
+  /// This method should install an IR translator pass, which converts from
+  /// LLVM code to machine instructions with possibly generic opcodes.
+  virtual bool addIRTranslator() { return true; }
+
+  /// This method may be implemented by targets that want to run passes
+  /// immediately before the register bank selection.
+  virtual void addPreRegBankSelect() {}
+
+  /// This method should install a register bank selector pass, which
+  /// assigns register banks to virtual registers without a register
+  /// class or register banks.
+  virtual bool addRegBankSelect() { return true; }
+
   /// Add the complete, standard set of LLVM CodeGen passes.
   /// Fully developed targets will not generally override this.
   virtual void addMachinePasses();
@@ -457,6 +470,9 @@ namespace llvm {
   /// DeadMachineInstructionElim - This pass removes dead machine instructions.
   extern char &DeadMachineInstructionElimID;
 
+  /// This pass adds dead/undef flags after analyzing subregister lanes.
+  extern char &DetectDeadLanesID;
+
   /// FastRegisterAllocation Pass - This pass register allocates as fast as
   /// possible. It is best suited for debug code where live ranges are short.
   ///
@@ -484,6 +500,10 @@ namespace llvm {
   /// ExpandPostRAPseudos - This pass expands pseudo instructions after
   /// register allocation.
   extern char &ExpandPostRAPseudosID;
+
+  /// createPostRAHazardRecognizer - This pass runs the post-ra hazard
+  /// recognizer.
+  extern char &PostRAHazardRecognizerID;
 
   /// createPostRAScheduler - This pass performs post register allocation
   /// scheduling.
@@ -586,6 +606,9 @@ namespace llvm {
   /// \brief This pass lays out funclets contiguously.
   extern char &FuncletLayoutID;
 
+  /// \brief This pass implements the "patchable-function" attribute.
+  extern char &PatchableFunctionID;
+
   /// createStackProtectorPass - This pass adds stack protectors to functions.
   ///
   FunctionPass *createStackProtectorPass(const TargetMachine *TM);
@@ -654,6 +677,28 @@ namespace llvm {
   /// memory accesses to target specific intrinsics.
   ///
   FunctionPass *createInterleavedAccessPass(const TargetMachine *TM);
+
+  /// LowerEmuTLS - This pass generates __emutls_[vt].xyz variables for all
+  /// TLS variables for the emulated TLS model.
+  ///
+  ModulePass *createLowerEmuTLSPass(const TargetMachine *TM);
+
+  /// This pass lowers the @llvm.load.relative intrinsic to instructions.
+  /// This is unsafe to do earlier because a pass may combine the constant
+  /// initializer into the load, which may result in an overflowing evaluation.
+  ModulePass *createPreISelIntrinsicLoweringPass();
+
+  /// GlobalMerge - This pass merges internal (by default) globals into structs
+  /// to enable reuse of a base pointer by indexed addressing modes.
+  /// It can also be configured to focus on size optimizations only.
+  ///
+  Pass *createGlobalMergePass(const TargetMachine *TM, unsigned MaximalOffset,
+                              bool OnlyOptimizeForSize = false,
+                              bool MergeExternalByDefault = false);
+
+  /// This pass splits the stack into a safe stack and an unsafe stack to
+  /// protect against stack-based overflow vulnerabilities.
+  FunctionPass *createSafeStackPass(const TargetMachine *TM = nullptr);
 } // End llvm namespace
 
 /// Target machine pass initializer for passes with dependencies. Use with

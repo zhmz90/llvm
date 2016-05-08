@@ -73,10 +73,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Value.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Scalar.h"
 #include <vector>
 using namespace llvm;
 
@@ -140,6 +138,11 @@ void DivergencePropagator::exploreSyncDependency(TerminatorInst *TI) {
   //   a2 = 2;
   // a = phi(a1, a2); // sync dependent on (tid < 5)
   BasicBlock *ThisBB = TI->getParent();
+
+  // Unreachable blocks may not be in the dominator tree.
+  if (!DT.isReachableFromEntry(ThisBB))
+    return;
+
   BasicBlock *IPostDom = PDT.getNode(ThisBB)->getIDom()->getBlock();
   if (IPostDom == nullptr)
     return;
@@ -147,7 +150,7 @@ void DivergencePropagator::exploreSyncDependency(TerminatorInst *TI) {
   for (auto I = IPostDom->begin(); isa<PHINode>(I); ++I) {
     // A PHINode is uniform if it returns the same value no matter which path is
     // taken.
-    if (!cast<PHINode>(I)->hasConstantValue() && DV.insert(&*I).second)
+    if (!cast<PHINode>(I)->hasConstantOrUndefValue() && DV.insert(&*I).second)
       Worklist.push_back(&*I);
   }
 
@@ -259,7 +262,7 @@ char DivergenceAnalysis::ID = 0;
 INITIALIZE_PASS_BEGIN(DivergenceAnalysis, "divergence", "Divergence Analysis",
                       false, true)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(PostDominatorTree)
+INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 INITIALIZE_PASS_END(DivergenceAnalysis, "divergence", "Divergence Analysis",
                     false, true)
 
@@ -269,7 +272,7 @@ FunctionPass *llvm::createDivergenceAnalysisPass() {
 
 void DivergenceAnalysis::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<DominatorTreeWrapperPass>();
-  AU.addRequired<PostDominatorTree>();
+  AU.addRequired<PostDominatorTreeWrapperPass>();
   AU.setPreservesAll();
 }
 
@@ -285,9 +288,10 @@ bool DivergenceAnalysis::runOnFunction(Function &F) {
     return false;
 
   DivergentValues.clear();
+  auto &PDT = getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
   DivergencePropagator DP(F, TTI,
                           getAnalysis<DominatorTreeWrapperPass>().getDomTree(),
-                          getAnalysis<PostDominatorTree>(), DivergentValues);
+                          PDT, DivergentValues);
   DP.populateWithSourcesOfDivergence();
   DP.propagate();
   return false;

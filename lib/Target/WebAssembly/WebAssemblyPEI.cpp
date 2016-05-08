@@ -23,7 +23,6 @@
 // can be easily applied.
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/IndexedMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
@@ -42,7 +41,6 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetFrameLowering.h"
@@ -59,7 +57,7 @@ namespace llvm {
 void initializeWasmPEIPass(PassRegistry&);
 }
 namespace {
-class WasmPEI : public MachineFunctionPass {
+class WasmPEI final : public MachineFunctionPass {
 public:
   static char ID;
   WasmPEI() : MachineFunctionPass(ID) {
@@ -528,7 +526,7 @@ AdjustStackOffset(MachineFrameInfo *MFI, int FrameIdx,
   MaxAlign = std::max(MaxAlign, Align);
 
   // Adjust to alignment boundary.
-  Offset = RoundUpToAlignment(Offset, Align, Skew);
+  Offset = alignTo(Offset, Align, Skew);
 
   if (StackGrowsDown) {
     DEBUG(dbgs() << "alloc FI(" << FrameIdx << ") at SP[" << -Offset << "]\n");
@@ -612,7 +610,7 @@ void WasmPEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
 
       unsigned Align = MFI->getObjectAlignment(i);
       // Adjust to alignment boundary
-      Offset = RoundUpToAlignment(Offset, Align, Skew);
+      Offset = alignTo(Offset, Align, Skew);
 
       MFI->setObjectOffset(i, -Offset);        // Set the computed offset
     }
@@ -621,7 +619,7 @@ void WasmPEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
     for (int i = MaxCSFI; i >= MinCSFI ; --i) {
       unsigned Align = MFI->getObjectAlignment(i);
       // Adjust to alignment boundary
-      Offset = RoundUpToAlignment(Offset, Align, Skew);
+      Offset = alignTo(Offset, Align, Skew);
 
       MFI->setObjectOffset(i, Offset);
       Offset += MFI->getObjectSize(i);
@@ -654,7 +652,7 @@ void WasmPEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
     unsigned Align = MFI->getLocalFrameMaxAlign();
 
     // Adjust to alignment boundary.
-    Offset = RoundUpToAlignment(Offset, Align, Skew);
+    Offset = alignTo(Offset, Align, Skew);
 
     DEBUG(dbgs() << "Local frame base offset: " << Offset << "\n");
 
@@ -773,7 +771,7 @@ void WasmPEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
     // If the frame pointer is eliminated, all frame offsets will be relative to
     // SP not FP. Align to MaxAlign so this works.
     StackAlign = std::max(StackAlign, MaxAlign);
-    Offset = RoundUpToAlignment(Offset, StackAlign, Skew);
+    Offset = alignTo(Offset, StackAlign, Skew);
   }
 
   // Update frame info to pretend that this is part of the stack...
@@ -867,7 +865,7 @@ void WasmPEI::replaceFrameIndices(MachineBasicBlock *BB, MachineFunction &Fn,
   unsigned FrameSetupOpcode = TII.getCallFrameSetupOpcode();
   unsigned FrameDestroyOpcode = TII.getCallFrameDestroyOpcode();
 
-  if (RS && !FrameIndexVirtualScavenging) RS->enterBasicBlock(BB);
+  if (RS && !FrameIndexVirtualScavenging) RS->enterBasicBlock(*BB);
 
   bool InsideCallSequence = false;
 
@@ -877,16 +875,7 @@ void WasmPEI::replaceFrameIndices(MachineBasicBlock *BB, MachineFunction &Fn,
         I->getOpcode() == FrameDestroyOpcode) {
       InsideCallSequence = (I->getOpcode() == FrameSetupOpcode);
       SPAdj += TII.getSPAdjust(I);
-
-      MachineBasicBlock::iterator PrevI = BB->end();
-      if (I != BB->begin()) PrevI = std::prev(I);
-      TFI->eliminateCallFramePseudoInstr(Fn, *BB, I);
-
-      // Visit the instructions created by eliminateCallFramePseudoInstr().
-      if (PrevI == BB->end())
-        I = BB->begin();     // The replaced instr was the first in the block.
-      else
-        I = std::next(PrevI);
+      I = TFI->eliminateCallFramePseudoInstr(Fn, *BB, I);
       continue;
     }
 
@@ -986,7 +975,7 @@ WasmPEI::scavengeFrameVirtualRegs(MachineFunction &Fn) {
   // Run through the instructions and find any virtual registers.
   for (MachineFunction::iterator BB = Fn.begin(),
        E = Fn.end(); BB != E; ++BB) {
-    RS->enterBasicBlock(&*BB);
+    RS->enterBasicBlock(*BB);
 
     int SPAdj = 0;
 

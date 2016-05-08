@@ -427,6 +427,10 @@ added in the future:
 
     - On X86-64 the callee preserves all general purpose registers, except for
       RDI and RAX.
+"``swiftcc``" - This calling convention is used for Swift language.
+    - On X86-64 RCX and R8 are available for additional integer returns, and
+      XMM2 and XMM3 are available for additional FP/vector returns.
+    - On iOS platforms, we use AAPCS-VFP calling convention.
 "``cc <n>``" - Numbered convention
     Any calling convention may be specified by number, allowing
     target-specific calling conventions to be used. Target specific
@@ -760,6 +764,25 @@ some can only be checked when producing an object file:
 * No global value in the expression can be a declaration, since that
   would require a relocation, which is not possible.
 
+.. _langref_ifunc:
+
+IFuncs
+-------
+
+IFuncs, like as aliases, don't create any new data or func. They are just a new
+symbol that dynamic linker resolves at runtime by calling a resolver function.
+
+IFuncs have a name and a resolver that is a function called by dynamic linker
+that returns address of another function associated with the name.
+
+IFunc may have an optional :ref:`linkage type <linkage>` and an optional
+:ref:`visibility style <visibility>`.
+
+Syntax::
+
+    @<Name> = [Linkage] [Visibility] ifunc <IFuncTy>, <ResolverTy>* @<Resolver>
+
+
 .. _langref_comdats:
 
 Comdats
@@ -907,8 +930,7 @@ Currently, only the following parameter attributes are defined:
 ``zeroext``
     This indicates to the code generator that the parameter or return
     value should be zero-extended to the extent required by the target's
-    ABI (which is usually 32-bits, but is 8-bits for a i1 on x86-64) by
-    the caller (for a parameter) or the callee (for a return value).
+    ABI by the caller (for a parameter) or the callee (for a return value).
 ``signext``
     This indicates to the code generator that the parameter or return
     value should be sign-extended to the extent required by the target's
@@ -1058,6 +1080,30 @@ Currently, only the following parameter attributes are defined:
     or ``null`` (i.e. it may be both ``null`` and
     ``dereferenceable(<n>)``). This attribute may only be applied to
     pointer typed parameters.
+
+``swiftself``
+    This indicates that the parameter is the self/context parameter. This is not
+    a valid attribute for return values and can only be applied to one
+    parameter.
+
+``swifterror``
+    This attribute is motivated to model and optimize Swift error handling. It
+    can be applied to a parameter with pointer to pointer type or a
+    pointer-sized alloca. At the call site, the actual argument that corresponds
+    to a ``swifterror`` parameter has to come from a ``swifterror`` alloca. A
+    ``swifterror`` value (either the parameter or the alloca) can only be loaded
+    and stored from, or used as a ``swifterror`` argument. This is not a valid
+    attribute for return values and can only be applied to one parameter.
+
+    These constraints allow the calling convention to optimize access to
+    ``swifterror`` variables by associating them with a specific register at
+    call boundaries rather than placing them in memory. Since this does change
+    the calling convention, a function which uses the ``swifterror`` attribute
+    on a parameter is not ABI-compatible with one which does not.
+
+    These constraints also allow LLVM to assume that a ``swifterror`` argument
+    does not alias any other memory visible within a function and that a
+    ``swifterror`` alloca passed as an argument does not escape.
 
 .. _gc:
 
@@ -1223,6 +1269,15 @@ example:
     epilogue, the backend should forcibly align the stack pointer.
     Specify the desired alignment, which must be a power of two, in
     parentheses.
+``allocsize(<EltSizeParam>[, <NumEltsParam>])``
+    This attribute indicates that the annotated function will always return at
+    least a given number of bytes (or null). Its arguments are zero-indexed
+    parameter numbers; if one argument is provided, then it's assumed that at
+    least ``CallSite.Args[EltSizeParam]`` bytes will be available at the
+    returned pointer. If two are provided, then it's assumed that
+    ``CallSite.Args[EltSizeParam] * CallSite.Args[NumEltsParam]`` bytes are
+    available. The referenced parameters must be integer types. No assumptions
+    are made about the contents of the returned block of memory.
 ``alwaysinline``
     This attribute indicates that the inliner should attempt to inline
     this function into callers whenever possible, ignoring any active
@@ -1239,10 +1294,26 @@ example:
     function call are also considered to be cold; and, thus, given low
     weight.
 ``convergent``
-    This attribute indicates that the callee is dependent on a convergent
-    thread execution pattern under certain parallel execution models.
-    Transformations that are execution model agnostic may not make the execution
-    of a convergent operation control dependent on any additional values.
+    In some parallel execution models, there exist operations that cannot be
+    made control-dependent on any additional values.  We call such operations
+    ``convergent``, and mark them with this attribute.
+
+    The ``convergent`` attribute may appear on functions or call/invoke
+    instructions.  When it appears on a function, it indicates that calls to
+    this function should not be made control-dependent on additional values.
+    For example, the intrinsic ``llvm.cuda.syncthreads`` is ``convergent``, so
+    calls to this intrinsic cannot be made control-dependent on additional
+    values.
+
+    When it appears on a call/invoke, the ``convergent`` attribute indicates
+    that we should treat the call as though we're calling a convergent
+    function.  This is particularly useful on indirect calls; without this we
+    may treat such calls as though the target is non-convergent.
+
+    The optimizer may remove the ``convergent`` attribute on functions when it
+    can prove that the function does not execute any convergent operations.
+    Similarly, the optimizer may remove ``convergent`` on calls/invokes when it
+    can prove that the call/invoke cannot call a convergent function.
 ``inaccessiblememonly``
     This attribute indicates that the function may only access memory that
     is not accessible by the module being compiled. This is a weaker form
@@ -1334,6 +1405,31 @@ example:
     passes make choices that keep the code size of this function low,
     and otherwise do optimizations specifically to reduce code size as
     long as they do not significantly impact runtime performance.
+``"patchable-function"``
+    This attribute tells the code generator that the code
+    generated for this function needs to follow certain conventions that
+    make it possible for a runtime function to patch over it later.
+    The exact effect of this attribute depends on its string value,
+    for which there currently is one legal possiblity:
+
+     * ``"prologue-short-redirect"`` - This style of patchable
+       function is intended to support patching a function prologue to
+       redirect control away from the function in a thread safe
+       manner.  It guarantees that the first instruction of the
+       function will be large enough to accommodate a short jump
+       instruction, and will be sufficiently aligned to allow being
+       fully changed via an atomic compare-and-swap instruction.
+       While the first requirement can be satisfied by inserting large
+       enough NOP, LLVM can and will try to re-purpose an existing
+       instruction (i.e. one that would have to be emitted anyway) as
+       the patchable instruction larger than a short jump.
+
+       ``"prologue-short-redirect"`` is currently only supported on
+       x86-64.
+
+    This attribute by itself does not imply restrictions on
+    inter-procedural optimizations.  All of the semantic effects the
+    patching may have to be separately conveyed via the linkage type.
 ``readnone``
     On a function, this attribute indicates that the function computes its
     result (or decides to unwind an exception) based strictly on its arguments,
@@ -1511,13 +1607,15 @@ operand bundle to not miscompile programs containing it.
   ways before control is transferred to the callee or invokee.
 - Calls and invokes with operand bundles have unknown read / write
   effect on the heap on entry and exit (even if the call target is
-  ``readnone`` or ``readonly``), unless they're overriden with
+  ``readnone`` or ``readonly``), unless they're overridden with
   callsite specific attributes.
 - An operand bundle at a call site cannot change the implementation
   of the called function.  Inter-procedural optimizations work as
   usual as long as they take into account the first two properties.
 
 More specific types of operand bundles are described below.
+
+.. _deopt_opbundles:
 
 Deoptimization Operand Bundles
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1579,6 +1677,8 @@ caller's deoptimization state to the callee's deoptimization state is
 semantically equivalent to composing the caller's deoptimization
 continuation after the callee's deoptimization continuation.
 
+.. _ob_funclet:
+
 Funclet Operand Bundles
 ^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1587,6 +1687,30 @@ operand bundle tag.  These operand bundles indicate that a call site
 is within a particular funclet.  There can be at most one
 ``"funclet"`` operand bundle attached to a call site and it must have
 exactly one bundle operand.
+
+If any funclet EH pads have been "entered" but not "exited" (per the
+`description in the EH doc\ <ExceptionHandling.html#wineh-constraints>`_),
+it is undefined behavior to execute a ``call`` or ``invoke`` which:
+
+* does not have a ``"funclet"`` bundle and is not a ``call`` to a nounwind
+  intrinsic, or
+* has a ``"funclet"`` bundle whose operand is not the most-recently-entered
+  not-yet-exited funclet EH pad.
+
+Similarly, if no funclet EH pads have been entered-but-not-yet-exited,
+executing a ``call`` or ``invoke`` with a ``"funclet"`` bundle is undefined behavior.
+
+GC Transition Operand Bundles
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+GC transition operand bundles are characterized by the
+``"gc-transition"`` operand bundle tag. These operand bundles mark a
+call as a transition between a function with one GC strategy to a
+function with a different GC strategy. If coordinating the transition
+between GC strategies requires additional code generation at the call
+site, these bundles may contain any values that are needed by the
+generated code.  For more details, see :ref:`GC Transitions
+<gc_transition_args>`.
 
 .. _moduleasm:
 
@@ -2071,6 +2195,26 @@ function's scope.
     uselistorder i32 7, { 1, 0 }
     uselistorder i32 (i32) @bar, { 1, 0 }
     uselistorder_bb @foo, %bb, { 5, 1, 3, 2, 0, 4 }
+
+.. _source_filename:
+
+Source Filename
+---------------
+
+The *source filename* string is set to the original module identifier,
+which will be the name of the compiled source file when compiling from
+source through the clang front end, for example. It is then preserved through
+the IR and bitcode.
+
+This is currently necessary to generate a consistent unique global
+identifier for local functions used in profile data, which prepends the
+source file name to the local function name.
+
+The syntax for the source file name is simply:
+
+.. code-block:: llvm
+
+    source_filename = "/path/to/source.c"
 
 .. _typesystem:
 
@@ -3105,7 +3249,7 @@ the same register to an output and an input. If this is not safe (e.g. if the
 assembly contains two instructions, where the first writes to one output, and
 the second reads an input and writes to a second output), then the "``&``"
 modifier must be used (e.g. "``=&r``") to specify that the output is an
-"early-clobber" output. Marking an ouput as "early-clobber" ensures that LLVM
+"early-clobber" output. Marking an output as "early-clobber" ensures that LLVM
 will not use the same register for any inputs (other than an input tied to this
 output).
 
@@ -3778,7 +3922,7 @@ references to them from instructions).
 
     !0 = !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "clang",
                         isOptimized: true, flags: "-O2", runtimeVersion: 2,
-                        splitDebugFilename: "abc.debug", emissionKind: 1,
+                        splitDebugFilename: "abc.debug", emissionKind: FullDebug,
                         enums: !2, retainedTypes: !3, subprograms: !4,
                         globals: !5, imports: !6, macros: !7, dwoId: 0x0abcd)
 
@@ -3864,21 +4008,28 @@ The following ``tag:`` values are valid:
 
 .. code-block:: llvm
 
-  DW_TAG_formal_parameter   = 5
   DW_TAG_member             = 13
   DW_TAG_pointer_type       = 15
   DW_TAG_reference_type     = 16
   DW_TAG_typedef            = 22
+  DW_TAG_inheritance        = 28
   DW_TAG_ptr_to_member_type = 31
   DW_TAG_const_type         = 38
+  DW_TAG_friend             = 42
   DW_TAG_volatile_type      = 53
   DW_TAG_restrict_type      = 55
 
+.. _DIDerivedTypeMember:
+
 ``DW_TAG_member`` is used to define a member of a :ref:`composite type
-<DICompositeType>` or :ref:`subprogram <DISubprogram>`. The type of the member
-is the ``baseType:``. The ``offset:`` is the member's bit offset.
-``DW_TAG_formal_parameter`` is used to define a member which is a formal
-argument of a subprogram.
+<DICompositeType>`. The type of the member is the ``baseType:``. The
+``offset:`` is the member's bit offset.  If the composite type has an ODR
+``identifier:`` and does not set ``flags: DIFwdDecl``, then the member is
+uniqued based only on its ``name:`` and ``scope:``.
+
+``DW_TAG_inheritance`` and ``DW_TAG_friend`` are used in the ``elements:``
+field of :ref:`composite types <DICompositeType>` to describe parents and
+friends.
 
 ``DW_TAG_typedef`` is used to provide a name for the ``baseType:``.
 
@@ -3897,9 +4048,15 @@ DICompositeType
 structures and unions. ``elements:`` points to a tuple of the composed types.
 
 If the source language supports ODR, the ``identifier:`` field gives the unique
-identifier used for type merging between modules. When specified, other types
-can refer to composite types indirectly via a :ref:`metadata string
-<metadata-string>` that matches their identifier.
+identifier used for type merging between modules.  When specified,
+:ref:`subprogram declarations <DISubprogramDeclaration>` and :ref:`member
+derived types <DIDerivedTypeMember>` that reference the ODR-type in their
+``scope:`` change uniquing rules.
+
+For a given ``identifier:``, there should only be a single composite type that
+does not have  ``flags: DIFlagFwdDecl`` set.  LLVM tools that link modules
+together will unique such definitions at parse time via the ``identifier:``
+field, even if the nodes are ``distinct``.
 
 .. code-block:: llvm
 
@@ -3919,9 +4076,6 @@ The following ``tag:`` values are valid:
   DW_TAG_enumeration_type = 4
   DW_TAG_structure_type   = 19
   DW_TAG_union_type       = 23
-  DW_TAG_subroutine_type  = 21
-  DW_TAG_inheritance      = 28
-
 
 For ``DW_TAG_array_type``, the ``elements:`` should be :ref:`subrange
 descriptors <DISubrange>`, each representing the range of subscripts at that
@@ -3935,7 +4089,9 @@ value for the set. All enumeration type descriptors are collected in the
 
 For ``DW_TAG_structure_type``, ``DW_TAG_class_type``, and
 ``DW_TAG_union_type``, the ``elements:`` should be :ref:`derived types
-<DIDerivedType>` with ``tag: DW_TAG_member`` or ``tag: DW_TAG_inheritance``.
+<DIDerivedType>` with ``tag: DW_TAG_member``, ``tag: DW_TAG_inheritance``, or
+``tag: DW_TAG_friend``; or :ref:`subprograms <DISubprogram>` with
+``isDefinition: false``.
 
 .. _DISubrange:
 
@@ -4024,6 +4180,14 @@ metadata. The ``variables:`` field points at :ref:`variables <DILocalVariable>`
 that must be retained, even if their IR counterparts are optimized out of
 the IR. The ``type:`` field must point at an :ref:`DISubroutineType`.
 
+.. _DISubprogramDeclaration:
+
+When ``isDefinition: false``, subprograms describe a declaration in the type
+tree as opposed to a definition of a function.  If the scope is a composite
+type with an ODR ``identifier:`` and that does not set ``flags: DIFwdDecl``,
+then the subprogram declaration is uniqued based only on its ``linkageName:``
+and ``scope:``.
+
 .. code-block:: llvm
 
     define void @_Z3foov() !dbg !0 {
@@ -4032,7 +4196,7 @@ the IR. The ``type:`` field must point at an :ref:`DISubroutineType`.
 
     !0 = distinct !DISubprogram(name: "foo", linkageName: "_Zfoov", scope: !1,
                                 file: !2, line: 7, type: !3, isLocal: true,
-                                isDefinition: false, scopeLine: 8,
+                                isDefinition: true, scopeLine: 8,
                                 containingType: !4,
                                 virtuality: DW_VIRTUALITY_pure_virtual,
                                 virtualIndex: 10, flags: DIFlagPrototyped,
@@ -4248,11 +4412,19 @@ instructions (loads, stores, memory-accessing calls, etc.) that carry
 ``noalias`` metadata can specifically be specified not to alias with some other
 collection of memory access instructions that carry ``alias.scope`` metadata.
 Each type of metadata specifies a list of scopes where each scope has an id and
-a domain. When evaluating an aliasing query, if for some domain, the set
+a domain.
+
+When evaluating an aliasing query, if for some domain, the set
 of scopes with that domain in one instruction's ``alias.scope`` list is a
 subset of (or equal to) the set of scopes for that domain in another
 instruction's ``noalias`` list, then the two memory accesses are assumed not to
 alias.
+
+Because scopes in one domain don't affect scopes in other domains, separate
+domains can be used to compose multiple independent noalias sets.  This is
+used for example during inlining.  As the noalias function parameters are
+turned into noalias scope metadata, a new domain is used every time the
+function is inlined.
 
 The metadata identifying each domain is itself a list containing one or two
 entries. The first entry is the name of the domain. Note that if the name is a
@@ -4528,6 +4700,38 @@ For example:
 
    !0 = !{!"llvm.loop.unroll.full"}
 
+'``llvm.loop.licm_versioning.disable``' Metadata
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This metadata indicates that the loop should not be versioned for the purpose
+of enabling loop-invariant code motion (LICM). The metadata has a single operand
+which is the string ``llvm.loop.licm_versioning.disable``. For example:
+
+.. code-block:: llvm
+
+   !0 = !{!"llvm.loop.licm_versioning.disable"}
+
+'``llvm.loop.distribute.enable``' Metadata
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Loop distribution allows splitting a loop into multiple loops.  Currently,
+this is only performed if the entire loop cannot be vectorized due to unsafe
+memory dependencies.  The transformation will atempt to isolate the unsafe
+dependencies into their own loop.
+
+This metadata can be used to selectively enable or disable distribution of the
+loop.  The first operand is the string ``llvm.loop.distribute.enable`` and the
+second operand is a bit. If the bit operand value is 1 distribution is
+enabled. A value of 0 disables distribution:
+
+.. code-block:: llvm
+
+   !0 = !{!"llvm.loop.distribute.enable", i1 0}
+   !1 = !{!"llvm.loop.distribute.enable", i1 1}
+
+This metadata should be used in conjunction with ``llvm.loop`` loop
+identification metadata.
+
 '``llvm.mem``'
 ^^^^^^^^^^^^^^^
 
@@ -4541,7 +4745,8 @@ The ``llvm.mem.parallel_loop_access`` metadata refers to a loop identifier,
 or metadata containing a list of loop identifiers for nested loops.
 The metadata is attached to memory accessing instructions and denotes that
 no loop carried memory dependence exist between it and other instructions denoted
-with the same loop identifier.
+with the same loop identifier. The metadata on memory reads also implies that
+if conversion (i.e. speculative execution within a loop iteration) is safe.
 
 Precisely, given two instructions ``m1`` and ``m2`` that both have the
 ``llvm.mem.parallel_loop_access`` metadata, with ``L1`` and ``L2`` being the
@@ -5404,10 +5609,12 @@ The ``parent`` argument is the token of the funclet that contains the
 ``catchswitch`` instruction. If the ``catchswitch`` is not inside a funclet,
 this operand may be the token ``none``.
 
-The ``default`` argument is the label of another basic block beginning with a
-"pad" instruction, one of ``cleanuppad`` or ``catchswitch``.
+The ``default`` argument is the label of another basic block beginning with
+either a ``cleanuppad`` or ``catchswitch`` instruction.  This unwind destination
+must be a legal target with respect to the ``parent`` links, as described in
+the `exception handling documentation\ <ExceptionHandling.html#wineh-constraints>`_.
 
-The ``handlers`` are a list of successor blocks that each begin with a
+The ``handlers`` are a nonempty list of successor blocks that each begin with a
 :ref:`catchpad <i_catchpad>` instruction.
 
 Semantics:
@@ -5430,82 +5637,6 @@ Example:
       %cs1 = catchswitch within none [label %handler0, label %handler1] unwind to caller
     dispatch2:
       %cs2 = catchswitch within %parenthandler [label %handler0] unwind label %cleanup
-
-.. _i_catchpad:
-
-'``catchpad``' Instruction
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Syntax:
-"""""""
-
-::
-
-      <resultval> = catchpad within <catchswitch> [<args>*]
-
-Overview:
-"""""""""
-
-The '``catchpad``' instruction is used by `LLVM's exception handling
-system <ExceptionHandling.html#overview>`_ to specify that a basic block
-begins a catch handler --- one where a personality routine attempts to transfer
-control to catch an exception.
-
-Arguments:
-""""""""""
-
-The ``catchswitch`` operand must always be a token produced by a
-:ref:`catchswitch <i_catchswitch>` instruction in a predecessor block. This
-ensures that each ``catchpad`` has exactly one predecessor block, and it always
-terminates in a ``catchswitch``.
-
-The ``args`` correspond to whatever information the personality routine
-requires to know if this is an appropriate handler for the exception. Control
-will transfer to the ``catchpad`` if this is the first appropriate handler for
-the exception.
-
-The ``resultval`` has the type :ref:`token <t_token>` and is used to match the
-``catchpad`` to corresponding :ref:`catchrets <i_catchret>` and other nested EH
-pads.
-
-Semantics:
-""""""""""
-
-When the call stack is being unwound due to an exception being thrown, the
-exception is compared against the ``args``. If it doesn't match, control will
-not reach the ``catchpad`` instruction.  The representation of ``args`` is
-entirely target and personality function-specific.
-
-Like the :ref:`landingpad <i_landingpad>` instruction, the ``catchpad``
-instruction must be the first non-phi of its parent basic block.
-
-The meaning of the tokens produced and consumed by ``catchpad`` and other "pad"
-instructions is described in the
-`Windows exception handling documentation <ExceptionHandling.html#wineh>`.
-
-Executing a ``catchpad`` instruction constitutes "entering" that pad.
-The pad may then be "exited" in one of three ways:
-
-1)  explicitly via a ``catchret`` that consumes it.  Executing such a ``catchret``
-    is undefined behavior if any descendant pads have been entered but not yet
-    exited.
-2)  implicitly via a call (which unwinds all the way to the current function's caller),
-    or via a ``catchswitch`` or a ``cleanupret`` that unwinds to caller.
-3)  implicitly via an unwind edge whose destination EH pad isn't a descendant of
-    the ``catchpad``.  When the ``catchpad`` is exited in this manner, it is
-    undefined behavior if the destination EH pad has a parent which is not an
-    ancestor of the ``catchpad`` being exited.
-
-Example:
-""""""""
-
-.. code-block:: llvm
-
-    dispatch:
-      %cs = catchswitch within none [label %handler0] unwind to caller
-      ;; A catch block which can catch an integer.
-    handler0:
-      %tok = catchpad within %cs [i8** @_ZTIi]
 
 .. _i_catchret:
 
@@ -5543,11 +5674,10 @@ unwinding was interrupted with a :ref:`catchpad <i_catchpad>` instruction.  The
 code to, for example, destroy the active exception.  Control then transfers to
 ``normal``.
 
-The ``token`` argument must be a token produced by a dominating ``catchpad``
-instruction. The ``catchret`` destroys the physical frame established by
-``catchpad``, so executing multiple returns on the same token without
-re-executing the ``catchpad`` will result in undefined behavior.
-See :ref:`catchpad <i_catchpad>` for more details.
+The ``token`` argument must be a token produced by a ``catchpad`` instruction.
+If the specified ``catchpad`` is not the most-recently-entered not-yet-exited
+funclet pad (as described in the `EH documentation\ <ExceptionHandling.html#wineh-constraints>`_),
+the ``catchret``'s behavior is undefined.
 
 Example:
 """"""""
@@ -5581,7 +5711,15 @@ Arguments:
 
 The '``cleanupret``' instruction requires one argument, which indicates
 which ``cleanuppad`` it exits, and must be a :ref:`cleanuppad <i_cleanuppad>`.
-It also has an optional successor, ``continue``.
+If the specified ``cleanuppad`` is not the most-recently-entered not-yet-exited
+funclet pad (as described in the `EH documentation\ <ExceptionHandling.html#wineh-constraints>`_),
+the ``cleanupret``'s behavior is undefined.
+
+The '``cleanupret``' instruction also has an optional successor, ``continue``,
+which must be the label of another basic block beginning with either a
+``cleanuppad`` or ``catchswitch`` instruction.  This unwind destination must
+be a legal target with respect to the ``parent`` links, as described in the
+`exception handling documentation\ <ExceptionHandling.html#wineh-constraints>`_.
 
 Semantics:
 """"""""""
@@ -5590,13 +5728,6 @@ The '``cleanupret``' instruction indicates to the
 :ref:`personality function <personalityfn>` that one
 :ref:`cleanuppad <i_cleanuppad>` it transferred control to has ended.
 It transfers control to ``continue`` or unwinds out of the function.
-
-The unwind destination ``continue``, if present, must be an EH pad
-whose parent is either ``none`` or an ancestor of the ``cleanuppad``
-being returned from.  This constitutes an exceptional exit from all
-ancestors of the completed ``cleanuppad``, up to but not including
-the parent of ``continue``.
-See :ref:`cleanuppad <i_cleanuppad>` for more details.
 
 Example:
 """"""""
@@ -6827,7 +6958,7 @@ Syntax:
 ::
 
       <result> = load [volatile] <ty>, <ty>* <pointer>[, align <alignment>][, !nontemporal !<index>][, !invariant.load !<index>][, !invariant.group !<index>][, !nonnull !<index>][, !dereferenceable !<deref_bytes_node>][, !dereferenceable_or_null !<deref_bytes_node>][, !align !<align_node>]
-      <result> = load atomic [volatile] <ty>* <pointer> [singlethread] <ordering>, align <alignment> [, !invariant.group !<index>]
+      <result> = load atomic [volatile] <ty>, <ty>* <pointer> [singlethread] <ordering>, align <alignment> [, !invariant.group !<index>]
       !<index> = !{ i32 1 }
       !<deref_bytes_node> = !{i64 <dereferenceable_bytes>}
       !<align_node> = !{ i64 <value_alignment> }
@@ -6996,7 +7127,7 @@ name ``<index>`` corresponding to a metadata node with one ``i32`` entry of
 value 1. The existence of the ``!nontemporal`` metadata on the instruction
 tells the optimizer and code generator that this load is not expected to
 be reused in the cache. The code generator may select special
-instructions to save cache bandwidth, such as the MOVNT instruction on
+instructions to save cache bandwidth, such as the ``MOVNT`` instruction on
 x86.
 
 The optional ``!invariant.group`` metadata must reference a 
@@ -7104,13 +7235,13 @@ Arguments:
 There are three arguments to the '``cmpxchg``' instruction: an address
 to operate on, a value to compare to the value currently be at that
 address, and a new value to place at that address if the compared values
-are equal. The type of '<cmp>' must be an integer type whose bit width
-is a power of two greater than or equal to eight and less than or equal
-to a target-specific size limit. '<cmp>' and '<new>' must have the same
-type, and the type of '<pointer>' must be a pointer to that type. If the
-``cmpxchg`` is marked as ``volatile``, then the optimizer is not allowed
-to modify the number or order of execution of this ``cmpxchg`` with
-other :ref:`volatile operations <volatile>`.
+are equal. The type of '<cmp>' must be an integer or pointer type whose
+bit width is a power of two greater than or equal to eight and less 
+than or equal to a target-specific size limit. '<cmp>' and '<new>' must
+have the same type, and the type of '<pointer>' must be a pointer to 
+that type. If the ``cmpxchg`` is marked as ``volatile``, then the 
+optimizer is not allowed to modify the number or order of execution of
+this ``cmpxchg`` with other :ref:`volatile operations <volatile>`.
 
 The success and failure :ref:`ordering <ordering>` arguments specify how this
 ``cmpxchg`` synchronizes with other atomic operations. Both ordering parameters
@@ -7151,11 +7282,11 @@ Example:
 .. code-block:: llvm
 
     entry:
-      %orig = atomic load i32, i32* %ptr unordered                ; yields i32
+      %orig = load atomic i32, i32* %ptr unordered, align 4                      ; yields i32
       br label %loop
 
     loop:
-      %cmp = phi i32 [ %orig, %entry ], [%old, %loop]
+      %cmp = phi i32 [ %orig, %entry ], [%value_loaded, %loop]
       %squared = mul i32 %cmp, %cmp
       %val_success = cmpxchg i32* %ptr, i32 %cmp, i32 %squared acq_rel monotonic ; yields  { i32, i1 }
       %value_loaded = extractvalue { i32, i1 } %val_success, 0
@@ -8037,7 +8168,7 @@ Arguments:
 
 The '``icmp``' instruction takes three operands. The first operand is
 the condition code indicating the kind of comparison to perform. It is
-not a value, just a keyword. The possible condition code are:
+not a value, just a keyword. The possible condition codes are:
 
 #. ``eq``: equal
 #. ``ne``: not equal
@@ -8134,7 +8265,7 @@ Arguments:
 
 The '``fcmp``' instruction takes three operands. The first operand is
 the condition code indicating the kind of comparison to perform. It is
-not a value, just a keyword. The possible condition code are:
+not a value, just a keyword. The possible condition codes are:
 
 #. ``false``: no comparison, always returns false
 #. ``oeq``: ordered and equal
@@ -8590,6 +8721,74 @@ Example:
                catch i8** @_ZTIi
                filter [1 x i8**] [@_ZTId]
 
+.. _i_catchpad:
+
+'``catchpad``' Instruction
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+::
+
+      <resultval> = catchpad within <catchswitch> [<args>*]
+
+Overview:
+"""""""""
+
+The '``catchpad``' instruction is used by `LLVM's exception handling
+system <ExceptionHandling.html#overview>`_ to specify that a basic block
+begins a catch handler --- one where a personality routine attempts to transfer
+control to catch an exception.
+
+Arguments:
+""""""""""
+
+The ``catchswitch`` operand must always be a token produced by a
+:ref:`catchswitch <i_catchswitch>` instruction in a predecessor block. This
+ensures that each ``catchpad`` has exactly one predecessor block, and it always
+terminates in a ``catchswitch``.
+
+The ``args`` correspond to whatever information the personality routine
+requires to know if this is an appropriate handler for the exception. Control
+will transfer to the ``catchpad`` if this is the first appropriate handler for
+the exception.
+
+The ``resultval`` has the type :ref:`token <t_token>` and is used to match the
+``catchpad`` to corresponding :ref:`catchrets <i_catchret>` and other nested EH
+pads.
+
+Semantics:
+""""""""""
+
+When the call stack is being unwound due to an exception being thrown, the
+exception is compared against the ``args``. If it doesn't match, control will
+not reach the ``catchpad`` instruction.  The representation of ``args`` is
+entirely target and personality function-specific.
+
+Like the :ref:`landingpad <i_landingpad>` instruction, the ``catchpad``
+instruction must be the first non-phi of its parent basic block.
+
+The meaning of the tokens produced and consumed by ``catchpad`` and other "pad"
+instructions is described in the
+`Windows exception handling documentation\ <ExceptionHandling.html#wineh>`_.
+
+When a ``catchpad`` has been "entered" but not yet "exited" (as
+described in the `EH documentation\ <ExceptionHandling.html#wineh-constraints>`_),
+it is undefined behavior to execute a :ref:`call <i_call>` or :ref:`invoke <i_invoke>`
+that does not carry an appropriate :ref:`"funclet" bundle <ob_funclet>`.
+
+Example:
+""""""""
+
+.. code-block:: llvm
+
+    dispatch:
+      %cs = catchswitch within none [label %handler0] unwind to caller
+      ;; A catch block which can catch an integer.
+    handler0:
+      %tok = catchpad within %cs [i8** @_ZTIi]
+
 .. _i_cleanuppad:
 
 '``cleanuppad``' Instruction
@@ -8644,22 +8843,10 @@ The ``cleanuppad`` instruction has several restrictions:
 -  A basic block that is not a cleanup block may not include a
    '``cleanuppad``' instruction.
 
-Executing a ``cleanuppad`` instruction constitutes "entering" that pad.
-The pad may then be "exited" in one of three ways:
-
-1)  explicitly via a ``cleanupret`` that consumes it.  Executing such a ``cleanupret``
-    is undefined behavior if any descendant pads have been entered but not yet
-    exited.
-2)  implicitly via a call (which unwinds all the way to the current function's caller),
-    or via a ``catchswitch`` or a ``cleanupret`` that unwinds to caller.
-3)  implicitly via an unwind edge whose destination EH pad isn't a descendant of
-    the ``cleanuppad``.  When the ``cleanuppad`` is exited in this manner, it is
-    undefined behavior if the destination EH pad has a parent which is not an
-    ancestor of the ``cleanuppad`` being exited.
-
-It is undefined behavior for the ``cleanuppad`` to exit via an unwind edge which
-does not transitively unwind to the same destination as a constituent
-``cleanupret``.
+When a ``cleanuppad`` has been "entered" but not yet "exited" (as
+described in the `EH documentation\ <ExceptionHandling.html#wineh-constraints>`_),
+it is undefined behavior to execute a :ref:`call <i_call>` or :ref:`invoke <i_invoke>`
+that does not carry an appropriate :ref:`"funclet" bundle <ob_funclet>`.
 
 Example:
 """"""""
@@ -9500,6 +9687,33 @@ should be inserted for value profiling of target expressions. ``-instrprof``
 pass will generate the appropriate data structures and replace the
 ``llvm.instrprof_value_profile`` intrinsic with the call to the profile
 runtime library with proper arguments.
+
+'``llvm.thread.pointer``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+::
+
+      declare i8* @llvm.thread.pointer()
+
+Overview:
+"""""""""
+
+The '``llvm.thread.pointer``' intrinsic returns the value of the thread
+pointer.
+
+Semantics:
+""""""""""
+
+The '``llvm.thread.pointer``' intrinsic returns a pointer to the TLS area
+for the current thread.  The exact semantics of this value are target
+specific: it may point to the start of TLS area, to the end, or somewhere
+in the middle.  Depending on the target, this intrinsic may read a register,
+call a helper function, read from an alternate memory space, or perform
+other operations necessary to locate the TLS area.  Not all targets support
+this intrinsic.
 
 Standard C Library Intrinsics
 -----------------------------
@@ -10463,8 +10677,8 @@ Overview:
 """""""""
 
 The '``llvm.bitreverse``' family of intrinsics is used to reverse the
-bitpattern of an integer value; for example ``0b1234567`` becomes
-``0b7654321``.
+bitpattern of an integer value; for example ``0b10110110`` becomes
+``0b01101101``.
 
 Semantics:
 """"""""""
@@ -10562,7 +10776,7 @@ targets support all bit widths or vector types, however.
       declare i32  @llvm.ctlz.i32 (i32  <src>, i1 <is_zero_undef>)
       declare i64  @llvm.ctlz.i64 (i64  <src>, i1 <is_zero_undef>)
       declare i256 @llvm.ctlz.i256(i256 <src>, i1 <is_zero_undef>)
-      declase <2 x i32> @llvm.ctlz.v2i32(<2 x i32> <src>, i1 <is_zero_undef>)
+      declare <2 x i32> @llvm.ctlz.v2i32(<2 x i32> <src>, i1 <is_zero_undef>)
 
 Overview:
 """""""""
@@ -10609,7 +10823,7 @@ support all bit widths or vector types, however.
       declare i32  @llvm.cttz.i32 (i32  <src>, i1 <is_zero_undef>)
       declare i64  @llvm.cttz.i64 (i64  <src>, i1 <is_zero_undef>)
       declare i256 @llvm.cttz.i256(i256 <src>, i1 <is_zero_undef>)
-      declase <2 x i32> @llvm.cttz.v2i32(<2 x i32> <src>, i1 <is_zero_undef>)
+      declare <2 x i32> @llvm.cttz.v2i32(<2 x i32> <src>, i1 <is_zero_undef>)
 
 Overview:
 """""""""
@@ -10984,7 +11198,7 @@ Examples of non-canonical encodings:
 - Many normal decimal floating point numbers have non-canonical alternative
   encodings.
 - Some machines, like GPUs or ARMv7 NEON, do not support subnormal values.
-  These are treated as non-canonical encodings of zero and with be flushed to
+  These are treated as non-canonical encodings of zero and will be flushed to
   a zero of the same sign by this operation.
 
 Note that per IEEE-754-2008 6.2, systems that support signaling NaNs with
@@ -11479,7 +11693,7 @@ The '``llvm.masked.scatter``' intrinsics is designed for writing selected vector
 
 ::
 
-       ;; This instruction unconditionaly stores data vector in multiple addresses
+       ;; This instruction unconditionally stores data vector in multiple addresses
        call @llvm.masked.scatter.v8i32 (<8 x i32> %value, <8 x i32*> %ptrs, i32 4,  <8 x i1>  <true, true, .. true>)
 
        ;; It is equivalent to a list of scalar stores
@@ -11863,43 +12077,40 @@ checked against the original guard by ``llvm.stackprotectorcheck``. If they are
 different, then ``llvm.stackprotectorcheck`` causes the program to abort by
 calling the ``__stack_chk_fail()`` function.
 
-'``llvm.stackprotectorcheck``' Intrinsic
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+'``llvm.stackguard``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Syntax:
 """""""
 
 ::
 
-      declare void @llvm.stackprotectorcheck(i8** <guard>)
+      declare i8* @llvm.stackguard()
 
 Overview:
 """""""""
 
-The ``llvm.stackprotectorcheck`` intrinsic compares ``guard`` against an already
-created stack protector and if they are not equal calls the
-``__stack_chk_fail()`` function.
+The ``llvm.stackguard`` intrinsic returns the system stack guard value.
+
+It should not be generated by frontends, since it is only for internal usage.
+The reason why we create this intrinsic is that we still support IR form Stack
+Protector in FastISel.
 
 Arguments:
 """"""""""
 
-The ``llvm.stackprotectorcheck`` intrinsic requires one pointer argument, the
-the variable ``@__stack_chk_guard``.
+None.
 
 Semantics:
 """"""""""
 
-This intrinsic is provided to perform the stack protector check by comparing
-``guard`` with the stack slot created by ``llvm.stackprotector`` and if the
-values do not match call the ``__stack_chk_fail()`` function.
+On some platforms, the value returned by this intrinsic remains unchanged
+between loads in the same thread. On other platforms, it returns the same
+global variable value, if any, e.g. ``@__stack_chk_guard``.
 
-The reason to provide this as an IR level intrinsic instead of implementing it
-via other IR operations is that in order to perform this operation at the IR
-level without an intrinsic, one would need to create additional basic blocks to
-handle the success/failure cases. This makes it difficult to stop the stack
-protector check from disrupting sibling tail calls in Codegen. With this
-intrinsic, we are able to generate the stack protector basic blocks late in
-codegen after the tail call decision has occurred.
+Currently some platforms have IR-level customized stack guard loading (e.g.
+X86 Linux) that is not handled by ``llvm.stackguard()``, while they should be
+in the future.
 
 '``llvm.objectsize``' Intrinsic
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -12053,8 +12264,9 @@ Overview:
 """""""""
 
 The ``llvm.donothing`` intrinsic doesn't perform any operation. It's one of only
-two intrinsics (besides ``llvm.experimental.patchpoint``) that can be called
-with an invoke instruction.
+three intrinsics (besides ``llvm.experimental.patchpoint`` and
+``llvm.experimental.gc.statepoint``) that can be called with an invoke
+instruction.
 
 Arguments:
 """"""""""
@@ -12066,6 +12278,152 @@ Semantics:
 
 This intrinsic does nothing, and it's removed by optimizers and ignored
 by codegen.
+
+'``llvm.experimental.deoptimize``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+::
+
+      declare type @llvm.experimental.deoptimize(...) [ "deopt"(...) ]
+
+Overview:
+"""""""""
+
+This intrinsic, together with :ref:`deoptimization operand bundles
+<deopt_opbundles>`, allow frontends to express transfer of control and
+frame-local state from the currently executing (typically more specialized,
+hence faster) version of a function into another (typically more generic, hence
+slower) version.
+
+In languages with a fully integrated managed runtime like Java and JavaScript
+this intrinsic can be used to implement "uncommon trap" or "side exit" like
+functionality.  In unmanaged languages like C and C++, this intrinsic can be
+used to represent the slow paths of specialized functions.
+
+
+Arguments:
+""""""""""
+
+The intrinsic takes an arbitrary number of arguments, whose meaning is
+decided by the :ref:`lowering strategy<deoptimize_lowering>`.
+
+Semantics:
+""""""""""
+
+The ``@llvm.experimental.deoptimize`` intrinsic executes an attached
+deoptimization continuation (denoted using a :ref:`deoptimization
+operand bundle <deopt_opbundles>`) and returns the value returned by
+the deoptimization continuation.  Defining the semantic properties of
+the continuation itself is out of scope of the language reference --
+as far as LLVM is concerned, the deoptimization continuation can
+invoke arbitrary side effects, including reading from and writing to
+the entire heap.
+
+Deoptimization continuations expressed using ``"deopt"`` operand bundles always
+continue execution to the end of the physical frame containing them, so all
+calls to ``@llvm.experimental.deoptimize`` must be in "tail position":
+
+   - ``@llvm.experimental.deoptimize`` cannot be invoked.
+   - The call must immediately precede a :ref:`ret <i_ret>` instruction.
+   - The ``ret`` instruction must return the value produced by the
+     ``@llvm.experimental.deoptimize`` call if there is one, or void.
+
+Note that the above restrictions imply that the return type for a call to
+``@llvm.experimental.deoptimize`` will match the return type of its immediate
+caller.
+
+The inliner composes the ``"deopt"`` continuations of the caller into the
+``"deopt"`` continuations present in the inlinee, and also updates calls to this
+intrinsic to return directly from the frame of the function it inlined into.
+
+.. _deoptimize_lowering:
+
+Lowering:
+"""""""""
+
+Calls to ``@llvm.experimental.deoptimize`` are lowered to calls to the
+symbol ``__llvm_deoptimize`` (it is the frontend's responsibility to
+ensure that this symbol is defined).  The call arguments to
+``@llvm.experimental.deoptimize`` are lowered as if they were formal
+arguments of the specified types, and not as varargs.
+
+
+'``llvm.experimental.guard``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+::
+
+      declare void @llvm.experimental.guard(i1, ...) [ "deopt"(...) ]
+
+Overview:
+"""""""""
+
+This intrinsic, together with :ref:`deoptimization operand bundles
+<deopt_opbundles>`, allows frontends to express guards or checks on
+optimistic assumptions made during compilation.  The semantics of
+``@llvm.experimental.guard`` is defined in terms of
+``@llvm.experimental.deoptimize`` -- its body is defined to be
+equivalent to:
+
+.. code-block:: llvm
+
+	define void @llvm.experimental.guard(i1 %pred, <args...>) {
+	  %realPred = and i1 %pred, undef
+	  br i1 %realPred, label %continue, label %leave [, !make.implicit !{}]
+
+	leave:
+	  call void @llvm.experimental.deoptimize(<args...>) [ "deopt"() ]
+	  ret void
+
+	continue:
+	  ret void
+	}
+
+
+with the optional ``[, !make.implicit !{}]`` present if and only if it
+is present on the call site.  For more details on ``!make.implicit``,
+see :doc:`FaultMaps`.
+
+In words, ``@llvm.experimental.guard`` executes the attached
+``"deopt"`` continuation if (but **not** only if) its first argument
+is ``false``.  Since the optimizer is allowed to replace the ``undef``
+with an arbitrary value, it can optimize guard to fail "spuriously",
+i.e. without the original condition being false (hence the "not only
+if"); and this allows for "check widening" type optimizations.
+
+``@llvm.experimental.guard`` cannot be invoked.
+
+
+'``llvm.load.relative``' Intrinsic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Syntax:
+"""""""
+
+::
+
+      declare i8* @llvm.load.relative.iN(i8* %ptr, iN %offset) argmemonly nounwind readonly
+
+Overview:
+"""""""""
+
+This intrinsic loads a 32-bit value from the address ``%ptr + %offset``,
+adds ``%ptr`` to that value and returns it. The constant folder specifically
+recognizes the form of this intrinsic and the constant initializers it may
+load from; if a loaded constant initializer is known to have the form
+``i32 trunc(x - %ptr)``, the intrinsic call is folded to ``x``.
+
+LLVM provides that the calculation of such a constant initializer will
+not overflow at link time under the medium code model if ``x`` is an
+``unnamed_addr`` function. However, it does not provide this guarantee for
+a constant initializer folded into a function body. This intrinsic can be
+used to avoid the possibility of overflows when loading from such a constant.
 
 Stack Map Intrinsics
 --------------------

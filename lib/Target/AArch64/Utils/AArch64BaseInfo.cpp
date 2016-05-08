@@ -11,7 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 #include "AArch64BaseInfo.h"
-#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Regex.h"
@@ -834,7 +833,7 @@ const AArch64NamedImmMapper::Mapping AArch64SysReg::SysRegMapper::SysRegMappings
 };
 
 uint32_t
-AArch64SysReg::SysRegMapper::fromString(StringRef Name, 
+AArch64SysReg::SysRegMapper::fromString(StringRef Name,
     const FeatureBitset& FeatureBits, bool &Valid) const {
   std::string NameLower = Name.lower();
 
@@ -878,7 +877,7 @@ AArch64SysReg::SysRegMapper::fromString(StringRef Name,
 }
 
 std::string
-AArch64SysReg::SysRegMapper::toString(uint32_t Bits, 
+AArch64SysReg::SysRegMapper::toString(uint32_t Bits,
                                       const FeatureBitset& FeatureBits) const {
   // First search the registers shared by all
   for (unsigned i = 0; i < array_lengthof(SysRegMappings); ++i) {

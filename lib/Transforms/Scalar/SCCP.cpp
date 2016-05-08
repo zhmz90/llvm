@@ -17,15 +17,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
@@ -38,6 +38,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
 using namespace llvm;
@@ -228,7 +229,7 @@ public:
   /// performing Interprocedural SCCP.
   void TrackValueOfGlobalVariable(GlobalVariable *GV) {
     // We only track the contents of scalar globals.
-    if (GV->getType()->getElementType()->isSingleValueType()) {
+    if (GV->getValueType()->isSingleValueType()) {
       LatticeVal &IV = TrackedGlobals[GV];
       if (!isa<UndefValue>(GV->getInitializer()))
         IV.markConstant(GV->getInitializer());
@@ -757,9 +758,14 @@ void SCCPSolver::visitCastInst(CastInst &I) {
   LatticeVal OpSt = getValueState(I.getOperand(0));
   if (OpSt.isOverdefined())          // Inherit overdefinedness of operand
     markOverdefined(&I);
-  else if (OpSt.isConstant())        // Propagate constant value
-    markConstant(&I, ConstantExpr::getCast(I.getOpcode(),
-                                           OpSt.getConstant(), I.getType()));
+  else if (OpSt.isConstant()) {
+    Constant *C =
+        ConstantExpr::getCast(I.getOpcode(), OpSt.getConstant(), I.getType());
+    if (isa<UndefValue>(C))
+      return;
+    // Propagate constant value
+    markConstant(&I, C);
+  }
 }
 
 
@@ -859,10 +865,14 @@ void SCCPSolver::visitBinaryOperator(Instruction &I) {
   LatticeVal &IV = ValueState[&I];
   if (IV.isOverdefined()) return;
 
-  if (V1State.isConstant() && V2State.isConstant())
-    return markConstant(IV, &I,
-                        ConstantExpr::get(I.getOpcode(), V1State.getConstant(),
-                                          V2State.getConstant()));
+  if (V1State.isConstant() && V2State.isConstant()) {
+    Constant *C = ConstantExpr::get(I.getOpcode(), V1State.getConstant(),
+                                    V2State.getConstant());
+    // X op Y -> undef.
+    if (isa<UndefValue>(C))
+      return;
+    return markConstant(IV, &I, C);
+  }
 
   // If something is undef, wait for it to resolve.
   if (!V1State.isOverdefined() && !V2State.isOverdefined())
@@ -917,10 +927,13 @@ void SCCPSolver::visitCmpInst(CmpInst &I) {
   LatticeVal &IV = ValueState[&I];
   if (IV.isOverdefined()) return;
 
-  if (V1State.isConstant() && V2State.isConstant())
-    return markConstant(IV, &I, ConstantExpr::getCompare(I.getPredicate(),
-                                                         V1State.getConstant(),
-                                                        V2State.getConstant()));
+  if (V1State.isConstant() && V2State.isConstant()) {
+    Constant *C = ConstantExpr::getCompare(
+        I.getPredicate(), V1State.getConstant(), V2State.getConstant());
+    if (isa<UndefValue>(C))
+      return;
+    return markConstant(IV, &I, C);
+  }
 
   // If operands are still undefined, wait for it to resolve.
   if (!V1State.isOverdefined() && !V2State.isOverdefined())
@@ -1020,8 +1033,11 @@ void SCCPSolver::visitGetElementPtrInst(GetElementPtrInst &I) {
 
   Constant *Ptr = Operands[0];
   auto Indices = makeArrayRef(Operands.begin() + 1, Operands.end());
-  markConstant(&I, ConstantExpr::getGetElementPtr(I.getSourceElementType(), Ptr,
-                                                  Indices));
+  Constant *C =
+      ConstantExpr::getGetElementPtr(I.getSourceElementType(), Ptr, Indices);
+  if (isa<UndefValue>(C))
+      return;
+  markConstant(&I, C);
 }
 
 void SCCPSolver::visitStoreInst(StoreInst &SI) {
@@ -1061,9 +1077,9 @@ void SCCPSolver::visitLoadInst(LoadInst &I) {
 
   Constant *Ptr = PtrVal.getConstant();
 
-  // load null -> null
+  // load null is undefined.
   if (isa<ConstantPointerNull>(Ptr) && I.getPointerAddressSpace() == 0)
-    return markConstant(IV, &I, UndefValue::get(I.getType()));
+    return;
 
   // Transform load (constant global) into the value loaded.
   if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
@@ -1079,8 +1095,11 @@ void SCCPSolver::visitLoadInst(LoadInst &I) {
   }
 
   // Transform load from a constant into a constant if possible.
-  if (Constant *C = ConstantFoldLoadFromConstPtr(Ptr, DL))
+  if (Constant *C = ConstantFoldLoadFromConstPtr(Ptr, I.getType(), DL)) {
+    if (isa<UndefValue>(C))
+      return;
     return markConstant(IV, &I, C);
+  }
 
   // Otherwise we cannot say for certain what value this load will produce.
   // Bail out.
@@ -1122,8 +1141,12 @@ CallOverdefined:
 
       // If we can constant fold this, mark the result of the call as a
       // constant.
-      if (Constant *C = ConstantFoldCall(F, Operands, TLI))
+      if (Constant *C = ConstantFoldCall(F, Operands, TLI)) {
+        // call -> undef.
+        if (isa<UndefValue>(C))
+          return;
         return markConstant(I, C);
+      }
     }
 
     // Otherwise, we don't know anything about this call, mark it overdefined.
@@ -1379,6 +1402,11 @@ bool SCCPSolver::ResolvedUndefsIn(Function &F) {
         // X % undef -> undef.  No change.
         if (Op1LV.isUndefined()) break;
 
+        // X / 0 -> undef.  No change.
+        // X % 0 -> undef.  No change.
+        if (Op1LV.isConstant() && Op1LV.getConstant()->isZeroValue())
+          break;
+
         // undef / X -> 0.   X could be maxint.
         // undef % X -> 0.   X could be 1.
         markForcedConstant(&I, Constant::getNullValue(ITy));
@@ -1537,36 +1565,11 @@ FunctionPass *llvm::createSCCPPass() {
   return new SCCP();
 }
 
-static void DeleteInstructionInBlock(BasicBlock *BB) {
-  DEBUG(dbgs() << "  BasicBlock Dead:" << *BB);
-  ++NumDeadBlocks;
-
-  // Check to see if there are non-terminating instructions to delete.
-  if (isa<TerminatorInst>(BB->begin()))
-    return;
-
-  // Delete the instructions backwards, as it has a reduced likelihood of having
-  // to update as many def-use and use-def chains.
-  Instruction *EndInst = BB->getTerminator(); // Last not to be deleted.
-  while (EndInst != BB->begin()) {
-    // Delete the next to last instruction.
-    Instruction *Inst = &*--EndInst->getIterator();
-    if (!Inst->use_empty())
-      Inst->replaceAllUsesWith(UndefValue::get(Inst->getType()));
-    if (Inst->isEHPad()) {
-      EndInst = Inst;
-      continue;
-    }
-    BB->getInstList().erase(Inst);
-    ++NumInstRemoved;
-  }
-}
-
 // runOnFunction() - Run the Sparse Conditional Constant Propagation algorithm,
 // and return true if the function was modified.
 //
 bool SCCP::runOnFunction(Function &F) {
-  if (skipOptnoneFunction(F))
+  if (skipFunction(F))
     return false;
 
   DEBUG(dbgs() << "SCCP on function '" << F.getName() << "'\n");
@@ -1598,7 +1601,11 @@ bool SCCP::runOnFunction(Function &F) {
 
   for (Function::iterator BB = F.begin(), E = F.end(); BB != E; ++BB) {
     if (!Solver.isBlockExecutable(&*BB)) {
-      DeleteInstructionInBlock(&*BB);
+      DEBUG(dbgs() << "  BasicBlock Dead:" << *BB);
+
+      ++NumDeadBlocks;
+      NumInstRemoved += removeAllNonTerminatorAndEHPadInstructions(&*BB);
+
       MadeChanges = true;
       continue;
     }
@@ -1638,39 +1645,6 @@ bool SCCP::runOnFunction(Function &F) {
   return MadeChanges;
 }
 
-namespace {
-  //===--------------------------------------------------------------------===//
-  //
-  /// IPSCCP Class - This class implements interprocedural Sparse Conditional
-  /// Constant Propagation.
-  ///
-  struct IPSCCP : public ModulePass {
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-      AU.addRequired<TargetLibraryInfoWrapperPass>();
-    }
-    static char ID;
-    IPSCCP() : ModulePass(ID) {
-      initializeIPSCCPPass(*PassRegistry::getPassRegistry());
-    }
-    bool runOnModule(Module &M) override;
-  };
-} // end anonymous namespace
-
-char IPSCCP::ID = 0;
-INITIALIZE_PASS_BEGIN(IPSCCP, "ipsccp",
-                "Interprocedural Sparse Conditional Constant Propagation",
-                false, false)
-INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
-INITIALIZE_PASS_END(IPSCCP, "ipsccp",
-                "Interprocedural Sparse Conditional Constant Propagation",
-                false, false)
-
-// createIPSCCPPass - This is the public interface to this file.
-ModulePass *llvm::createIPSCCPPass() {
-  return new IPSCCP();
-}
-
-
 static bool AddressIsTaken(const GlobalValue *GV) {
   // Delete any dead constantexpr klingons.
   GV->removeDeadConstantUsers();
@@ -1698,10 +1672,8 @@ static bool AddressIsTaken(const GlobalValue *GV) {
   return false;
 }
 
-bool IPSCCP::runOnModule(Module &M) {
-  const DataLayout &DL = M.getDataLayout();
-  const TargetLibraryInfo *TLI =
-      &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+static bool runIPSCCP(Module &M, const DataLayout &DL,
+                      const TargetLibraryInfo *TLI) {
   SCCPSolver Solver(DL, TLI);
 
   // AddressTakenFunctions - This set keeps track of the address-taken functions
@@ -1718,9 +1690,9 @@ bool IPSCCP::runOnModule(Module &M) {
     if (F->isDeclaration())
       continue;
 
-    // If this is a strong or ODR definition of this function, then we can
-    // propagate information about its result into callsites of it.
-    if (!F->mayBeOverridden())
+    // If this is an exact definition of this function, then we can propagate
+    // information about its result into callsites of it.
+    if (F->hasExactDefinition())
       Solver.AddTrackedFunction(&*F);
 
     // If this function only has direct calls that we can see, we can track its
@@ -1796,18 +1768,13 @@ bool IPSCCP::runOnModule(Module &M) {
 
     for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
       if (!Solver.isBlockExecutable(&*BB)) {
-        DeleteInstructionInBlock(&*BB);
-        MadeChanges = true;
+        DEBUG(dbgs() << "  BasicBlock Dead:" << *BB);
 
-        TerminatorInst *TI = BB->getTerminator();
-        for (BasicBlock *Succ : TI->successors()) {
-          if (!Succ->empty() && isa<PHINode>(Succ->begin()))
-            Succ->removePredecessor(&*BB);
-        }
-        if (!TI->use_empty())
-          TI->replaceAllUsesWith(UndefValue::get(TI->getType()));
-        TI->eraseFromParent();
-        new UnreachableInst(M.getContext(), &*BB);
+        ++NumDeadBlocks;
+        NumInstRemoved +=
+            changeToUnreachable(BB->getFirstNonPHI(), /*UseLLVMTrap=*/false);
+
+        MadeChanges = true;
 
         if (&*BB != &F->front())
           BlocksToErase.push_back(&*BB);
@@ -1951,3 +1918,51 @@ bool IPSCCP::runOnModule(Module &M) {
 
   return MadeChanges;
 }
+
+PreservedAnalyses IPSCCPPass::run(Module &M, AnalysisManager<Module> &AM) {
+  const DataLayout &DL = M.getDataLayout();
+  auto &TLI = AM.getResult<TargetLibraryAnalysis>(M);
+  if (!runIPSCCP(M, DL, &TLI))
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
+}
+
+namespace {
+//===--------------------------------------------------------------------===//
+//
+/// IPSCCP Class - This class implements interprocedural Sparse Conditional
+/// Constant Propagation.
+///
+struct IPSCCPLegacyPass : public ModulePass {
+  static char ID;
+
+  IPSCCPLegacyPass() : ModulePass(ID) {
+    initializeIPSCCPLegacyPassPass(*PassRegistry::getPassRegistry());
+  }
+
+  bool runOnModule(Module &M) override {
+    if (skipModule(M))
+      return false;
+    const DataLayout &DL = M.getDataLayout();
+    const TargetLibraryInfo *TLI =
+        &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+    return runIPSCCP(M, DL, TLI);
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+  }
+};
+} // end anonymous namespace
+
+char IPSCCPLegacyPass::ID = 0;
+INITIALIZE_PASS_BEGIN(IPSCCPLegacyPass, "ipsccp",
+                      "Interprocedural Sparse Conditional Constant Propagation",
+                      false, false)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+INITIALIZE_PASS_END(IPSCCPLegacyPass, "ipsccp",
+                    "Interprocedural Sparse Conditional Constant Propagation",
+                    false, false)
+
+// createIPSCCPPass - This is the public interface to this file.
+ModulePass *llvm::createIPSCCPPass() { return new IPSCCPLegacyPass(); }
